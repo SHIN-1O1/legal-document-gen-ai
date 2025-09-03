@@ -1,0 +1,22 @@
+# Core
+numpy==1.26.4
+faiss-cpu==1.7.4
+PyPDF2==3.0.1
+
+# GUI
+tk==0.1.0
+
+# LangChain + integrations
+langchain==0.2.16
+langchain-core==0.2.41
+langchain-community==0.2.11
+langchain-google-vertexai==0.1.6
+
+# HuggingFace embeddings
+sentence-transformers==2.7.0
+transformers==4.44.2
+torch==2.4.0
+
+# Utilities
+protobuf==4.25.3
+google-cloud-aiplatform==1.71.0
