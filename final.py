@@ -17,12 +17,10 @@ from langchain.embeddings import HuggingFaceEmbeddings
 
 import pickle
 
-# ----------------- CONFIG -----------------
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = r"D:\ayooooooo\gemini-api-key.json"
 VERTEX_VECTORSTORE_PATH = "vertex_vectorstore.faiss"
 LEGAL_VECTORSTORE_PATH = "legal_vectorstore.faiss"
 
-# ----------------- PDF Extraction -----------------
 def extract_text_from_pdf(pdf_path):
     try:
         reader = PdfReader(pdf_path)
@@ -33,17 +31,14 @@ def extract_text_from_pdf(pdf_path):
     except Exception as e:
         return f"Error reading PDF: {str(e)}"
 
-# ----------------- Build Dual Vectorstores -----------------
 def build_dual_vectorstores(document_text):
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     docs = splitter.create_documents([document_text])
 
-    # Vertex AI embeddings
     vertex_embeddings = VertexAIEmbeddings(model_name="text-embedding-005")
     vertex_store = FAISS.from_documents(docs, vertex_embeddings)
     vertex_store.save_local(VERTEX_VECTORSTORE_PATH)
 
-    # Legal-BERT embeddings
     legal_embeddings = HuggingFaceEmbeddings(model_name="nlpaueb/legal-bert-base-uncased")
     legal_store = FAISS.from_documents(docs, legal_embeddings)
     legal_store.save_local(LEGAL_VECTORSTORE_PATH)
@@ -65,7 +60,6 @@ def load_dual_vectorstores():
 
     return vertex_store, legal_store
 
-# ----------------- Hybrid Retriever -----------------
 def hybrid_retrieve(vertex_store, legal_store, query, top_k=3):
     results = []
 
@@ -85,7 +79,6 @@ def hybrid_retrieve(vertex_store, legal_store, query, top_k=3):
             doc = legal_store.docstore.search(doc_id)[0]
             results.append(doc)
 
-    # Deduplicate by content
     seen, unique_docs = set(), []
     for d in results:
         if d.page_content not in seen:
@@ -94,7 +87,6 @@ def hybrid_retrieve(vertex_store, legal_store, query, top_k=3):
 
     return unique_docs[:top_k]
 
-# ----------------- Ask Document -----------------
 def ask_document(vertex_store, legal_store, user_question, language="English"):
     llm = ChatVertexAI(model="gemini-2.5-flash-lite", temperature=0)
     relevant_docs = hybrid_retrieve(vertex_store, legal_store, user_question)
@@ -126,7 +118,6 @@ def ask_document(vertex_store, legal_store, user_question, language="English"):
     except Exception as e:
         return f"Error generating response: {str(e)}"
 
-# ----------------- GUI -----------------
 class PDFChatGUI:
     def __init__(self, root):
         self.root = root
@@ -148,9 +139,9 @@ class PDFChatGUI:
         self.chat_box.pack(pady=10)
         self.chat_box.config(state=tk.NORMAL)
         if self.vertex_store and self.legal_store:
-            self.chat_box.insert(tk.END, "✅ Loaded saved vectorstores (Vertex + Legal-BERT).\n")
+            self.chat_box.insert(tk.END, " Loaded saved vectorstores (Vertex + Legal-BERT).\n")
         else:
-            self.chat_box.insert(tk.END, "⚠️ No saved vectorstores found. Please load a PDF.\n")
+            self.chat_box.insert(tk.END, " No saved vectorstores found. Please load a PDF.\n")
         self.chat_box.config(state=tk.DISABLED)
 
         self.user_input = tk.Entry(root, width=90)
@@ -178,7 +169,7 @@ class PDFChatGUI:
         self.vertex_store, self.legal_store = build_dual_vectorstores(self.pdf_text)
 
         self.chat_box.config(state=tk.NORMAL)
-        self.chat_box.insert(tk.END, "✅ PDF processed and vectorstores saved!\n")
+        self.chat_box.insert(tk.END, " PDF processed and vectorstores saved!\n")
         self.chat_box.config(state=tk.DISABLED)
 
     def ask_question(self, event=None):
@@ -200,7 +191,6 @@ class PDFChatGUI:
         self.user_input.delete(0, tk.END)
         self.chat_box.yview(tk.END)
 
-# ----------------- Main -----------------
 if __name__ == "__main__":
     root = tk.Tk()
     app = PDFChatGUI(root)
