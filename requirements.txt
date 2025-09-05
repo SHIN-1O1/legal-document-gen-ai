@@ -1,22 +1,44 @@
+# ======================
 # Core
+# ======================
 numpy==1.26.4
-faiss-cpu==1.7.4
+pandas==2.2.2
 PyPDF2==3.0.1
 
-# GUI
-tk==0.1.0
-
-# LangChain + integrations
+# ======================
+# LangChain & Integrations
+# ======================
 langchain==0.2.16
 langchain-core==0.2.41
 langchain-community==0.2.11
-langchain-google-vertexai==0.1.6
+langchain-google-vertexai==2.0.0   # Google Vertex AI integration
 
+# ======================
 # HuggingFace embeddings
+# ======================
 sentence-transformers==2.7.0
-transformers==4.44.2
-torch==2.4.0
+transformers==4.41.0
+torch>=2.3.0
+faiss-cpu==1.8.0.post1
 
-# Utilities
-protobuf==4.25.3
-google-cloud-aiplatform==1.71.0
+# ======================
+# Google Cloud
+# ======================
+protobuf==5.25.3
+google-cloud-aiplatform==1.67.1
+
+# ======================
+# OCR & Imaging
+# ======================
+pytesseract==0.3.13
+Pillow==10.0.0
+
+# ======================
+# Optional (Windows TTS)
+# ======================
+pyttsx3; sys_platform == "win32"
+
+# ======================
+# GUI (usually comes with Python, but needed for some systems)
+# ======================
+tk
