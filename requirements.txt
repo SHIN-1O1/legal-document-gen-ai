@@ -1,44 +1,32 @@
-# ======================
-# Core
-# ======================
-numpy==1.26.4
-pandas==2.2.2
-PyPDF2==3.0.1
+# Core Google Vertex AI client
+google-cloud-aiplatform>=1.38.0
 
-# ======================
-# LangChain & Integrations
-# ======================
-langchain==0.2.16
-langchain-core==0.2.41
-langchain-community==0.2.11
-langchain-google-vertexai==2.0.0   # Google Vertex AI integration
+# LangChain ecosystem
+langchain>=0.2.0
+langchain-community>=0.2.0
 
-# ======================
-# HuggingFace embeddings
-# ======================
-sentence-transformers==2.7.0
-transformers==4.41.0
-torch>=2.3.0
-faiss-cpu==1.8.0.post1
+# Embeddings + NLP
+torch>=2.0.0
+transformers>=4.40.0
+sentence-transformers>=2.7.0
 
-# ======================
-# Google Cloud
-# ======================
-protobuf==5.25.3
-google-cloud-aiplatform==1.67.1
+# OCR and PDF
+pytesseract>=0.3.10
+Pillow>=10.0.0
+PyPDF2>=3.0.1
 
-# ======================
-# OCR & Imaging
-# ======================
-pytesseract==0.3.13
-Pillow==10.0.0
+# Token counting
+tiktoken>=0.7.0
 
-# ======================
-# Optional (Windows TTS)
-# ======================
-pyttsx3; sys_platform == "win32"
+# Language detection
+langdetect>=1.0.9
 
-# ======================
-# GUI (usually comes with Python, but needed for some systems)
-# ======================
-tk
+# Vector storage
+faiss-cpu>=1.7.4
+
+# Utilities
+requests>=2.31.0
+numpy>=1.26.0
+
+# GUI
+tk  # comes with Python stdlib on Windows/Linux/macOS, no pip install needed
