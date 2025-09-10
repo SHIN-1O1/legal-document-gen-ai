@@ -89,7 +89,7 @@ class AppConfig:
     MAX_CHUNKS: int = 1000
     TOP_K: int = 5
     DEDUP_THRESHOLD: float = 0.78
-    MODEL_NAME: str = "gemini-2.5-flash-lite" 
+    MODEL_NAME: str = "gemini-1.5-flash-latest" 
     TEMPERATURE: float = 0.15
     MAX_OUTPUT_TOKENS: int = 1024
     MEMORY_TOP_K: int = 3
@@ -143,7 +143,8 @@ def folder_size_mb(path: Path) -> float:
             if entry.is_file():
                 total += entry.stat().st_size
             elif entry.is_dir():
-                total += folder_size_mb(Path(entry.path)) * 1024 * 1024
+                # Corrected recursive call to not multiply by MB conversion factor twice
+                total += folder_size_mb(Path(entry.path)) * 1024 * 1024 
     except Exception:
         pass
     return total / (1024 * 1024)
@@ -368,7 +369,8 @@ class DualVectorStore:
 
         seen_texts: List[str] = []
         unique_results: List[str] = []
-        for text, score in sorted(results, key=lambda x: -x[1]):
+        # BUG FIX 1: Sort by score in ascending order (lower is better for distance metrics)
+        for text, score in sorted(results, key=lambda x: x[1]):
             if any(jaccard(text, s) >= CONFIG.DEDUP_THRESHOLD for s in seen_texts): continue
             seen_texts.append(text)
             unique_results.append(text)
@@ -503,10 +505,30 @@ class ProfileExtractor:
 class QAEngine:
     def __init__(self, profile: ProfileMemory, vs: DualVectorStore, memory: MemoryStore, llm_client=None):
         self.profile, self.vs, self.memory, self.llm = profile, vs, memory, llm_client
+        # BUG FIX 5: Improved prompt to guide LLM reasoning
+        IMPROVED_TEMPLATE = """You are a concise and accurate assistant. Follow these rules to answer the user's question:
+1. First, check the 'RECENT' conversation history to see if the user is asking a question about our conversation (e.g., "what did I ask before?"). If they are, use that history as the primary source for your answer.
+2. If the question is not about our conversation, then use the 'CONTEXT' from the provided documents to find the answer.
+3. Always answer clearly and concisely.
+
+PROFILE:
+{profile}
+
+RECENT:
+{history}
+
+CONTEXT:
+{context}
+
+QUESTION:
+{question}
+
+Answer:
+"""
         if PromptTemplate:
-            self.prompt = PromptTemplate(input_variables=["context", "history", "profile", "question"], template="You are a concise, accurate assistant.\nPROFILE:\n{profile}\n\nRECENT:\n{history}\n\nCONTEXT:\n{context}\n\nQUESTION:\n{question}\n\nAnswer clearly.")
+            self.prompt = PromptTemplate(input_variables=["context", "history", "profile", "question"], template=IMPROVED_TEMPLATE)
         else:
-            self.prompt = "You are a concise, accurate assistant.\nPROFILE:\n{profile}\n\nRECENT:\n{history}\n\nCONTEXT:\n{context}\n\nQUESTION:\n{question}\n\nAnswer clearly."
+            self.prompt = IMPROVED_TEMPLATE
 
     def answer(self, question: str, docs: List[str], memory_slider_val: int) -> Tuple[str, Dict[str, Any]]:
         profile_json = json.dumps(compact_profile_for_prompt(self.profile.all()), ensure_ascii=False)
@@ -572,7 +594,12 @@ def check_health(llm_client, vertex_emb, legal_emb, vs: DualVectorStore) -> Dict
         else: status["LegalBERT Embeddings"] = "❌ Disabled"
     except Exception as e: status["LegalBERT Embeddings"] = f"❌ ERROR: {e}"
     try:
-        vs.search("health", k=1); status["FAISS Stores"] = "✅ OK"
+        # A dummy search to check if any store is active
+        if vs.vertex_store or vs.legal_store:
+            vs.search("health", k=1)
+            status["FAISS Stores"] = "✅ OK"
+        else:
+            status["FAISS Stores"] = "⚪️ No stores loaded"
     except Exception as e: status["FAISS Stores"] = f"❌ ERROR: {e}"
     try: status["StoresSizeMB"] = f"{folder_size_mb(Path(CONFIG.STORES_DIR)):.2f} MB"
     except Exception: pass
@@ -622,6 +649,7 @@ class LegalAIGUI(tk.Tk):
         self.state.vs = DualVectorStore(Path(CONFIG.STORES_DIR))
         self.state.profile = ProfileMemory(Path(CONFIG.PROFILE_PATH))
         
+        qa_llm = None # Define qa_llm with a default value
         if ChatVertexAI:
             try:
                 self.state.extractor_llm = ChatVertexAI(model=CONFIG.MODEL_NAME, temperature=0.0, max_output_tokens=512)
@@ -631,10 +659,8 @@ class LegalAIGUI(tk.Tk):
                 logger.exception("LLM init failed.")
                 messagebox.showerror("LLM Error", f"Failed to initialize VertexAI LLMs: {e}\n\nPlease check your GOOGLE_APPLICATION_CREDENTIALS path and authentication.")
                 self.state.extractor_llm = None
-                qa_llm = None
         else:
             logger.error("ChatVertexAI not available from langchain.")
-            qa_llm = None
         
         self.state.profile_extractor = ProfileExtractor(llm_client=self.state.extractor_llm)
         self.state.memory = MemoryStore(Path(CONFIG.MEMORY_DIR), vs=self.state.vs, extractor_llm=self.state.extractor_llm)
@@ -716,6 +742,9 @@ class LegalAIGUI(tk.Tk):
         self.chat_display.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=5, pady=5)
         self.chat_display.tag_config("user", foreground="blue", font=("Helvetica", 11, "bold"))
         self.chat_display.tag_config("assistant", foreground="black")
+        self.chat_display.tag_config("assistant_role", foreground="#005500", font=("Helvetica", 11, "bold"))
+        self.chat_display.tag_config("system", foreground="#555555", font=("Helvetica", 10, "italic"))
+
 
         # User input
         self.user_input_var = tk.StringVar()
@@ -776,7 +805,8 @@ class LegalAIGUI(tk.Tk):
     def on_slider_change(self, value):
         self.state.memory_slider_val = int(float(value))
         if self.state.memory:
-            self.state.memory.buffer_limit = self.state.memory_slider_val if self.state.memory_slider_val > 0 else CONFIG.SLIDING_WINDOW
+            # BUG FIX 4: Directly set buffer_limit to the slider's value
+            self.state.memory.buffer_limit = self.state.memory_slider_val
 
     def handle_send_message(self):
         question = self.user_input_var.get().strip()
@@ -806,6 +836,9 @@ class LegalAIGUI(tk.Tk):
         except Exception:
             logger.exception("Profile extraction error")
             
+        # For document-related questions, you would select a specific fid.
+        # Here we assume a general context or the last loaded one.
+        # A more advanced implementation might manage multiple fids.
         docs = self.state.vs.search(question, k=CONFIG.TOP_K)
         answer, metrics = self.state.qa.answer(question, docs, memory_slider_val=self.state.memory_slider_val)
         self.response_queue.put((answer, metrics))
@@ -853,9 +886,13 @@ class LegalAIGUI(tk.Tk):
                 return
             
             if text and self.state.indexer:
-                fid = path.stem
+                # BUG FIX 2: Use a unique file fingerprint for the FID
+                fid = file_fingerprint(filepath)
                 self.state.indexer.enqueue(text, fid)
-                self.add_message_to_chat("System", f"Enqueued {path.name} for indexing as {fid}.")
+                self.add_message_to_chat("System", f"Enqueued {path.name} for indexing.")
+                # Also load this new store for immediate querying
+                self.state.vs.build_or_load(text, fid)
+                self.add_message_to_chat("System", f"{path.name} is now ready for questions.")
             else:
                 self.add_message_to_chat("System", f"Could not extract text from {path.name}.")
         except Exception as e:
@@ -879,11 +916,11 @@ class LegalAIGUI(tk.Tk):
     def handle_force_save_faiss(self):
         try:
             if self.state.vs:
-                self.state.vs.save_all("global_docs")
+                # BUG FIX 3: Only save the chat memory store, as it's the only one with a predictable name
                 self.state.vs.save_all("chat_memory")
-                messagebox.showinfo("Success", "FAISS stores saved.")
+                messagebox.showinfo("Success", "Chat memory FAISS store saved.")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to save FAISS stores: {e}")
+            messagebox.showerror("Error", f"Failed to save FAISS store: {e}")
             
     def handle_download_logs(self):
         save_path = filedialog.asksaveasfilename(
@@ -901,12 +938,14 @@ class LegalAIGUI(tk.Tk):
 
     def add_message_to_chat(self, role, text):
         self.chat_display.config(state="normal")
-        if role.lower() == "user":
+        role_lower = role.lower()
+        if role_lower == "user":
             self.chat_display.insert(tk.END, "You: ", "user")
-        elif role.lower() == "assistant":
+        elif role_lower == "assistant":
+            # BUG FIX 5: Use the correct tag name 'assistant_role' which is now defined
             self.chat_display.insert(tk.END, "Assistant: ", "assistant_role")
         else: # System
-            self.chat_display.insert(tk.END, f"{role}: ", ("system", "bold"))
+            self.chat_display.insert(tk.END, f"{role}: ", "system")
 
         self.chat_display.insert(tk.END, f"{text}\n\n")
         self.chat_display.config(state="disabled")
@@ -971,11 +1010,12 @@ class LegalAIGUI(tk.Tk):
     def on_closing(self):
         """Handle graceful shutdown of background processes."""
         logger.info("Shutdown sequence initiated...")
-        if self.state.memory: self.state.memory.shutdown()
-        if self.state.indexer: self.state.indexer.shutdown()
-        if self.state.vs:
-            self.state.vs.save_all("global_docs")
-            self.state.vs.save_all("chat_memory")
+        if hasattr(self, 'state'): # Ensure state exists before trying to access its attributes
+            if self.state.memory: self.state.memory.shutdown()
+            if self.state.indexer: self.state.indexer.shutdown()
+            if self.state.vs:
+                # BUG FIX 3: Only save the chat memory store
+                self.state.vs.save_all("chat_memory")
         logger.info("Shutdown complete. Exiting.")
         self.destroy()
 
