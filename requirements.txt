@@ -30,3 +30,4 @@ numpy>=1.26.0
 
 # GUI
 tk  # comes with Python stdlib on Windows/Linux/macOS, no pip install needed
+matplotlib>=3.8.0

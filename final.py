@@ -1,981 +1,985 @@
-#!/usr/bin/env python3
-"""
-app.py — Integrated Legal AI Assistant (single-file)
-
-Features:
- - Dual FAISS vectorstores: VertexAI embeddings + Legal-BERT (HuggingFace)
- - Chat via ChatVertexAI (Gemini) with compact prompts
- - Profile persistence (profile.json) extracted only from user messages
- - Memory buffer + summarization saved as searchable memory entries (embedding-backed)
- - Token monitoring (tiktoken + HF tokenizer) with GUI warnings
- - Optional web fallback (DuckDuckGo HTML scraping) when local context missing
- - Threaded indexing and search for responsive Tkinter GUI
-"""
-
 import os
 import sys
 import json
-import hashlib
+import time
+import math
 import logging
 import threading
-from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
 import queue
-import time
-import re
-import html
-import urllib.parse
+import hashlib
+from dataclasses import dataclass
+from pathlib import Path
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+import atexit
 
-# GUI
+# --- GUI Imports ---
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+from tkinter import ttk, filedialog, scrolledtext, messagebox
 
-# OCR / PDF
-from PIL import Image, ImageEnhance
-import pytesseract
-from PyPDF2 import PdfReader
+# --- Charting Imports ---
+try:
+    import matplotlib
+    matplotlib.use("TkAgg")
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
 
-# language detection
-from langdetect import detect, DetectorFactory
-DetectorFactory.seed = 0
 
-# LangChain & embeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
-from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_google_vertexai import VertexAIEmbeddings, ChatVertexAI
-from langchain.docstore.document import Document
+# --- Original third-party imports (best-effort) ---
+try:
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+    from langchain.prompts import PromptTemplate
+    from langchain.docstore.document import Document
+    from langchain_community.vectorstores import FAISS
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    from langchain_google_vertexai import VertexAIEmbeddings, ChatVertexAI
+    from vertexai.language_models import TextEmbeddingModel
+except Exception:
+    RecursiveCharacterTextSplitter, PromptTemplate, Document, FAISS = None, None, None, None
+    HuggingFaceEmbeddings, VertexAIEmbeddings, ChatVertexAI, TextEmbeddingModel = None, None, None, None
 
-# tokenizers
 try:
     import tiktoken
 except Exception:
     tiktoken = None
-from transformers import AutoTokenizer
 
-# light web requests
-import requests
-from bs4 import BeautifulSoup  # optional (pip install beautifulsoup4)
+try:
+    from transformers import AutoTokenizer
+except Exception:
+    AutoTokenizer = None
 
-# -----------------------------------------------------------------------------
-# CONFIG
-# -----------------------------------------------------------------------------
+try:
+    from PyPDF2 import PdfReader
+except Exception:
+    PdfReader = None
+
+try:
+    import docx
+except Exception:
+    docx = None
+
+try:
+    from PIL import Image, ImageEnhance
+    import pytesseract
+except Exception:
+    Image, pytesseract = None, None
+
+try:
+    from langdetect import detect, DetectorFactory
+    DetectorFactory.seed = 0
+except Exception:
+    def detect(text): return "en"
+
+# ---------- CONFIG ----------
 @dataclass
 class AppConfig:
-    # your Vertex credentials json path (update if needed)
-    GOOGLE_APPLICATION_CREDENTIALS: str = r"D:\\GEN_AI_25\\gemini-api-key.json"
-
-    # storage
+    GOOGLE_APPLICATION_CREDENTIALS: str = r"D:\GEN_AI_25\gemini-api-key.json" # <-- IMPORTANT: UPDATE THIS PATH 
     DATA_DIR: str = "data"
     CACHE_DIR: str = "cache"
     MEMORY_DIR: str = "memory"
     PROFILE_PATH: str = "profile.json"
-
-    # chunking / indexing
-    CHUNK_SIZE: int = 500
-    CHUNK_OVERLAP: int = 50
+    STORES_DIR: str = "stores"
+    CHUNK_SIZE: int = 600
+    CHUNK_OVERLAP: int = 60
     MIN_CHUNK_LENGTH: int = 50
-    MAX_CHUNKS: int = 200
-
+    MAX_CHUNKS: int = 1000
     TOP_K: int = 5
-    DEDUP_THRESHOLD: float = 0.8
-
-    # LLM / embeddings
-    MODEL_NAME: str = "gemini-2.5-flash-lite"
-    TEMPERATURE: float = 0.2
+    DEDUP_THRESHOLD: float = 0.78
+    MODEL_NAME: str = "gemini-2.5-flash-lite" 
+    TEMPERATURE: float = 0.15
     MAX_OUTPUT_TOKENS: int = 1024
-
-    # memory config
     MEMORY_TOP_K: int = 3
-    MEMORY_TRUNCATE_CHARS: int = 400
+    MEMORY_TRUNCATE_CHARS: int = 420
     CONTEXT_TRUNCATE_CHARS: int = 900
-
-    # faiss save interval (reduce I/O)
-    FAISS_SAVE_INTERVAL: int = 6
-
-    # indexing worker count
+    FAISS_SAVE_EVERY: int = 8
+    SUMMARIZE_BATCH: int = 8
+    SLIDING_WINDOW: int = 5
     INDEX_THREADS: int = 2
-
-    # web fallback
-    USE_WEB_FALLBACK: bool = True
-    MAX_WEB_RESULTS: int = 3
-    WEB_TIMEOUT: int = 6  # seconds
-
-    # token limits for warnings
-    LLM_TOKEN_WARN_RATIO: float = 0.8
-    EMB_TOKEN_WARN_RATIO: float = 0.9
-    EMB_MAX_TOKENS: int = 512  # for Legal-BERT
 
     def __post_init__(self):
         Path(self.DATA_DIR).mkdir(parents=True, exist_ok=True)
         Path(self.CACHE_DIR).mkdir(parents=True, exist_ok=True)
         Path(self.MEMORY_DIR).mkdir(parents=True, exist_ok=True)
+        Path(self.STORES_DIR).mkdir(parents=True, exist_ok=True)
 
 CONFIG = AppConfig()
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = CONFIG.GOOGLE_APPLICATION_CREDENTIALS
+if CONFIG.GOOGLE_APPLICATION_CREDENTIALS and Path(CONFIG.GOOGLE_APPLICATION_CREDENTIALS).exists():
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = CONFIG.GOOGLE_APPLICATION_CREDENTIALS
 
-# -----------------------------------------------------------------------------
-# LOGGING
-# -----------------------------------------------------------------------------
-def setup_logging() -> logging.Logger:
-    Path(CONFIG.DATA_DIR).mkdir(exist_ok=True)
-    log_file = Path(CONFIG.DATA_DIR) / f"legal_ai_{datetime.now():%Y%m%d}.log"
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        handlers=[logging.FileHandler(log_file, encoding="utf-8"), logging.StreamHandler(sys.stdout)],
-    )
-    return logging.getLogger("legal-ai")
+# ---------- Logging ----------
+logfile = Path(CONFIG.DATA_DIR) / f"app_{datetime.now():%Y%m%d_%H%M%S}.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.FileHandler(logfile, encoding="utf-8"), logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("legal-ai")
 
-logger = setup_logging()
+def tail_log_lines(path: Path, n: int = 200) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        return "".join(lines[-n:])
+    except Exception:
+        return ""
 
-# -----------------------------------------------------------------------------
-# UTILITIES
-# -----------------------------------------------------------------------------
+# ---------- Utilities ----------
 def file_fingerprint(path: str) -> str:
-    st = Path(path).stat()
-    s = f"{path}|{st.st_mtime_ns}|{st.st_size}"
-    return hashlib.md5(s.encode()).hexdigest()
+    try:
+        st = Path(path).stat()
+        s = f"{path}|{st.st_mtime_ns}|{st.st_size}"
+        return hashlib.md5(s.encode()).hexdigest()
+    except Exception:
+        return hashlib.md5(path.encode()).hexdigest()
+
+def folder_size_mb(path: Path) -> float:
+    total = 0
+    try:
+        for entry in os.scandir(path):
+            if entry.is_file():
+                total += entry.stat().st_size
+            elif entry.is_dir():
+                total += folder_size_mb(Path(entry.path)) * 1024 * 1024
+    except Exception:
+        pass
+    return total / (1024 * 1024)
 
 def compact_profile_for_prompt(profile: Dict[str, Any]) -> Dict[str, str]:
-    # return only non-empty top-level keys (exclude internal extras) to save tokens
     return {k: str(v) for k, v in profile.items() if v and k != "_extra"}
 
-# -----------------------------------------------------------------------------
-# TOKEN MONITOR
-# -----------------------------------------------------------------------------
+# ---------- Token monitor ----------
 class TokenMonitor:
     def __init__(self):
-        # tiktoken for LLM token estimates
         self.enc = None
         if tiktoken:
             try:
                 self.enc = tiktoken.get_encoding("cl100k_base")
             except Exception:
                 self.enc = None
-        # HF tokenizer for Legal-BERT token counting
         try:
-            self.bert_tok = AutoTokenizer.from_pretrained("nlpaueb/legal-bert-base-uncased")
+            self.bert_tok = AutoTokenizer.from_pretrained("nlpaueb/legal-bert-base-uncased") if AutoTokenizer else None
         except Exception:
             self.bert_tok = None
 
     def count_llm_tokens(self, text: str) -> int:
-        if not text:
-            return 0
+        if not text: return 0
         if self.enc:
-            try:
-                return len(self.enc.encode(text))
-            except Exception:
-                pass
-        # fallback rough estimate: avg 1.3 tokens per word
+            try: return len(self.enc.encode(text))
+            except Exception: pass
         return max(1, int(len(text.split()) * 1.3))
 
     def count_bert_tokens(self, text: str) -> int:
-        if not text:
-            return 0
+        if not text: return 0
         if self.bert_tok:
-            try:
-                toks = self.bert_tok.encode(text, add_special_tokens=False)
-                return len(toks)
-            except Exception:
-                pass
+            try: return len(self.bert_tok.encode(text, add_special_tokens=False))
+            except Exception: pass
         return max(1, int(len(text.split()) * 1.0))
 
-    def warnings_for(self, llm_tokens: int, emb_tokens: int) -> List[str]:
-        warns = []
-        if llm_tokens > CONFIG.LLM_TOKEN_WARN_RATIO * CONFIG.MAX_OUTPUT_TOKENS:
-            warns.append(f"⚠️ LLM tokens high: {llm_tokens}/{CONFIG.MAX_OUTPUT_TOKENS}")
-        if emb_tokens > CONFIG.EMB_TOKEN_WARN_RATIO * CONFIG.EMB_MAX_TOKENS:
-            warns.append(f"⚠️ Embedding tokens high: {emb_tokens}/{CONFIG.EMB_MAX_TOKENS}")
-        return warns
-
-TOKEN_MON = TokenMonitor()
-
-# -----------------------------------------------------------------------------
-# EXTRACTOR: PDF & IMAGE OCR with caching
-# -----------------------------------------------------------------------------
+# ---------- Extractor (document & image) ----------
 class Extractor:
     def __init__(self, cache_dir: Path):
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(exist_ok=True, parents=True)
+        self.cache_dir = cache_dir
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def from_pdf(self, pdf_path: str) -> str:
         fid = file_fingerprint(pdf_path)
         cpath = self.cache_dir / f"extract_{fid}.txt"
-        if cpath.exists():
-            return cpath.read_text(encoding="utf-8")
-
-        text = ""
+        if cpath.exists(): return cpath.read_text(encoding="utf-8")
+        text_parts = []
         try:
+            if PdfReader is None: raise RuntimeError("PyPDF2 not installed")
             with open(pdf_path, "rb") as f:
                 reader = PdfReader(f)
-                parts: List[str] = []
-                for i, page in enumerate(reader.pages, 1):
-                    try:
-                        txt = (page.extract_text() or "").strip()
-                    except Exception:
-                        txt = ""
-                    if txt:
-                        parts.append(f"\n--- Page {i} ---\n{txt}")
-                text = "\n".join(parts).strip()
-        except Exception:
-            logger.exception("Error reading PDF %s", pdf_path)
-            text = ""
-
-        if not text:
-            text = "No readable text found."
-        try:
-            cpath.write_text(text, encoding="utf-8")
-        except Exception:
-            logger.exception("Failed to cache PDF extraction %s", cpath)
+                for i, page in enumerate(reader.pages, start=1):
+                    txt = (page.extract_text() or "").strip()
+                    if txt: text_parts.append(f"\n--- Page {i} ---\n{txt}")
+        except Exception: logger.exception("Error reading PDF %s", pdf_path)
+        text = "\n".join(text_parts).strip() if text_parts else "No readable text found."
+        try: cpath.write_text(text, encoding="utf-8")
+        except Exception: logger.exception("Failed to cache PDF extraction %s", cpath)
         return text
+
+    def from_docx(self, docx_path: str) -> str:
+        fid = file_fingerprint(docx_path)
+        cpath = self.cache_dir / f"extract_{fid}.txt"
+        if cpath.exists(): return cpath.read_text(encoding="utf-8")
+        parts = []
+        try:
+            if docx is None: raise RuntimeError("python-docx not installed")
+            doc = docx.Document(docx_path)
+            for para in doc.paragraphs:
+                txt = para.text.strip()
+                if txt: parts.append(txt)
+        except Exception: logger.exception("DOCX read error %s", docx_path)
+        text = "\n".join(parts).strip() if parts else "No readable text found."
+        try: cpath.write_text(text, encoding="utf-8")
+        except Exception: logger.exception("Failed to cache DOCX extraction %s", cpath)
+        return text
+
+    def from_text(self, txt_path: str) -> str:
+        try: return Path(txt_path).read_text(encoding="utf-8")
+        except Exception:
+            logger.exception("Error reading text file %s", txt_path)
+            return ""
+
+    def from_json(self, json_path: str) -> str:
+        try:
+            data = json.loads(Path(json_path).read_text(encoding="utf-8"))
+            return json.dumps(data, ensure_ascii=False, indent=2)
+        except Exception:
+            logger.exception("Error reading json file %s", json_path)
+            return ""
 
     def from_image(self, image_path: str, lang: str = "eng") -> str:
         fid = file_fingerprint(image_path)
         cpath = self.cache_dir / f"extract_{fid}.txt"
-        if cpath.exists():
-            return cpath.read_text(encoding="utf-8")
-
+        if cpath.exists(): return cpath.read_text(encoding="utf-8")
         text = ""
         try:
+            if Image is None or pytesseract is None: raise RuntimeError("Pillow or pytesseract not installed")
             with Image.open(image_path) as im:
-                if im.mode != "L":
-                    im = im.convert("L")
+                if im.mode != "L": im = im.convert("L")
                 im = ImageEnhance.Contrast(im).enhance(1.6)
-                im = ImageEnhance.Sharpness(im).enhance(1.8)
+                im = ImageEnhance.Sharpness(im).enhance(1.5)
                 text = pytesseract.image_to_string(im, config="--oem 3 --psm 6", lang=lang) or ""
-        except Exception:
-            logger.exception("Image OCR error for %s", image_path)
-            text = ""
-
-        if not text:
-            text = "No readable text found."
-        try:
-            cpath.write_text(text, encoding="utf-8")
-        except Exception:
-            logger.exception("Failed to cache image extraction %s", cpath)
+        except Exception: logger.exception("Image OCR error for %s", image_path)
+        if not text.strip(): text = "No readable text found."
+        try: cpath.write_text(text, encoding="utf-8")
+        except Exception: logger.exception("Failed to cache image extraction %s", cpath)
         return text
 
-# -----------------------------------------------------------------------------
-# DUAL VECTOR STORE: Vertex + Legal-BERT using FAISS
-# -----------------------------------------------------------------------------
+# ---------- Dual Vector Store ----------
 class DualVectorStore:
-    def __init__(self, data_dir: Path):
-        self.data_dir = Path(data_dir)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-
-        # Initialize Vertex embeddings (may fail if quota/credentials missing)
-        self.vertex_emb = None
-        try:
-            self.vertex_emb = VertexAIEmbeddings(model_name="text-embedding-005")
-            logger.info("VertexAIEmbeddings initialized.")
-        except Exception:
-            logger.exception("VertexAIEmbeddings init failed; vertex embeddings disabled.")
-            self.vertex_emb = None
-
-        # Initialize Legal-BERT embeddings (HuggingFace)
-        self.legal_emb = None
-        try:
-            self.legal_emb = HuggingFaceEmbeddings(
-                model_name="nlpaueb/legal-bert-base-uncased",
-                model_kwargs={"device": "cpu"},
-                encode_kwargs={"normalize_embeddings": True},
-            )
-            logger.info("HuggingFace legal-bert embeddings initialized.")
-        except Exception:
-            logger.exception("HuggingFaceEmbeddings init failed; legal embeddings disabled.")
-            self.legal_emb = None
-
-        # FAISS stores
+    def __init__(self, base_dir: Path):
+        self.base_dir = base_dir
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.vertex_emb, self.legal_emb = None, None
         self.vertex_store: Optional[FAISS] = None
         self.legal_store: Optional[FAISS] = None
-
-        # lock and counters
         self._lock = threading.RLock()
-        self._vertex_add_count = 0
-        self._legal_add_count = 0
+        self._vertex_add_count, self._legal_add_count = 0, 0
+        self._init_embeddings()
 
-    def _vs_path(self, fid: str, kind: str) -> Path:
-        return self.data_dir / f"vs_{kind}_{fid}"
+    def _vs_path(self, fid: str, kind: str) -> Path: return self.base_dir / f"vs_{kind}_{fid}"
 
-    def build_or_load(self, text: Optional[str], fid: str) -> None:
-        splitter = RecursiveCharacterTextSplitter(chunk_size=CONFIG.CHUNK_SIZE, chunk_overlap=CONFIG.CHUNK_OVERLAP)
-        docs: List[Document] = []
-        if text:
-            docs = splitter.create_documents([text])
+    def _init_embeddings(self):
+        try:
+            if VertexAIEmbeddings is None: raise RuntimeError("VertexAIEmbeddings not available")
+            self.vertex_emb = VertexAIEmbeddings(model_name="text-embedding-004")
+            logger.info("VertexAIEmbeddings initialized.")
+        except Exception: logger.exception("VertexAIEmbeddings init failed.")
+        try:
+            if HuggingFaceEmbeddings is None: raise RuntimeError("HuggingFaceEmbeddings not available")
+            self.legal_emb = HuggingFaceEmbeddings(model_name="nlpaueb/legal-bert-base-uncased", model_kwargs={"device": "cpu"}, encode_kwargs={"normalize_embeddings": True})
+            logger.info("HuggingFace legal-bert embeddings initialized.")
+        except Exception: logger.exception("HuggingFaceEmbeddings init failed.")
+
+    def _load_or_create_store(self, fid: str):
+        with self._lock:
+            if self.vertex_emb:
+                vpath = self._vs_path(fid, "vertex")
+                try:
+                    if vpath.exists(): self.vertex_store = FAISS.load_local(vpath.as_posix(), self.vertex_emb, allow_dangerous_deserialization=True)
+                    else:
+                        self.vertex_store = FAISS.from_documents([Document(page_content="seed")], self.vertex_emb)
+                        self.vertex_store.save_local(vpath.as_posix())
+                except Exception: logger.exception(f"Vertex store error for {fid}")
+
+            if self.legal_emb:
+                lpath = self._vs_path(fid, "legal")
+                try:
+                    if lpath.exists(): self.legal_store = FAISS.load_local(lpath.as_posix(), self.legal_emb, allow_dangerous_deserialization=True)
+                    else:
+                        self.legal_store = FAISS.from_documents([Document(page_content="seed")], self.legal_emb)
+                        self.legal_store.save_local(lpath.as_posix())
+                except Exception: logger.exception(f"Legal store error for {fid}")
+
+    def build_or_load(self, text: Optional[str], fid: str):
+        if RecursiveCharacterTextSplitter is None:
+            docs: List[Document] = [Document(page_content=text or "")]
+        else:
+            splitter = RecursiveCharacterTextSplitter(chunk_size=CONFIG.CHUNK_SIZE, chunk_overlap=CONFIG.CHUNK_OVERLAP)
+            docs = splitter.create_documents([text]) if text else []
             docs = [d for d in docs if len(d.page_content.strip()) >= CONFIG.MIN_CHUNK_LENGTH]
-            if len(docs) > CONFIG.MAX_CHUNKS:
-                docs = docs[:CONFIG.MAX_CHUNKS]
+            if len(docs) > CONFIG.MAX_CHUNKS: docs = docs[:CONFIG.MAX_CHUNKS]
 
-        v_path = self._vs_path(fid, "vertex")
         with self._lock:
-            try:
-                if self.vertex_emb:
-                    if v_path.exists():
-                        self.vertex_store = FAISS.load_local(v_path.as_posix(), self.vertex_emb, allow_dangerous_deserialization=True)
-                        logger.info("Loaded vertex store %s", v_path.name)
-                    else:
-                        self.vertex_store = FAISS.from_documents(docs or [Document(page_content="seed")], self.vertex_emb)
-                        self.vertex_store.save_local(v_path.as_posix())
-                        logger.info("Created vertex store %s", v_path.name)
-            except Exception:
-                logger.exception("Vertex store error for %s", fid)
-                self.vertex_store = None
+            if self.vertex_emb:
+                v_path = self._vs_path(fid, "vertex")
+                try:
+                    self.vertex_store = FAISS.from_documents(docs or [Document(page_content="seed")], self.vertex_emb)
+                    self.vertex_store.save_local(v_path.as_posix())
+                    logger.info("Created/updated vertex store %s", v_path.name)
+                except Exception: logger.exception("Vertex store build error for %s", fid)
 
-        l_path = self._vs_path(fid, "legal")
-        with self._lock:
-            try:
-                if self.legal_emb:
-                    if l_path.exists():
-                        self.legal_store = FAISS.load_local(l_path.as_posix(), self.legal_emb, allow_dangerous_deserialization=True)
-                        logger.info("Loaded legal store %s", l_path.name)
-                    else:
-                        self.legal_store = FAISS.from_documents(docs or [Document(page_content="seed")], self.legal_emb)
-                        self.legal_store.save_local(l_path.as_posix())
-                        logger.info("Created legal store %s", l_path.name)
-            except Exception:
-                logger.exception("Legal store error for %s", fid)
-                self.legal_store = None
+            if self.legal_emb:
+                l_path = self._vs_path(fid, "legal")
+                try:
+                    self.legal_store = FAISS.from_documents(docs or [Document(page_content="seed")], self.legal_emb)
+                    self.legal_store.save_local(l_path.as_posix())
+                    logger.info("Created/updated legal store %s", l_path.name)
+                except Exception: logger.exception("Legal store build error for %s", fid)
 
     def add_doc_to_stores(self, doc: Document, fid: str):
         with self._lock:
             if self.vertex_store:
                 try:
-                    self.vertex_store.add_texts([doc.page_content])
+                    self.vertex_store.add_documents([doc])
                     self._vertex_add_count += 1
-                    if self._vertex_add_count % CONFIG.FAISS_SAVE_INTERVAL == 0:
+                    if self._vertex_add_count % CONFIG.FAISS_SAVE_EVERY == 0:
                         self.vertex_store.save_local(self._vs_path(fid, "vertex").as_posix())
-                except Exception:
-                    logger.exception("Error adding to vertex store")
+                except Exception: logger.exception("Error adding to vertex store")
             if self.legal_store:
                 try:
-                    self.legal_store.add_texts([doc.page_content])
+                    self.legal_store.add_documents([doc])
                     self._legal_add_count += 1
-                    if self._legal_add_count % CONFIG.FAISS_SAVE_INTERVAL == 0:
+                    if self._legal_add_count % CONFIG.FAISS_SAVE_EVERY == 0:
                         self.legal_store.save_local(self._vs_path(fid, "legal").as_posix())
-                except Exception:
-                    logger.exception("Error adding to legal store")
+                except Exception: logger.exception("Error adding to legal store")
+
+    def save_all(self, fid: str):
+        with self._lock:
+            try:
+                if self.vertex_store: self.vertex_store.save_local(self._vs_path(fid, "vertex").as_posix())
+                if self.legal_store: self.legal_store.save_local(self._vs_path(fid, "legal").as_posix())
+            except Exception: logger.exception("Error saving vectorstores")
 
     def search(self, query: str, k: int) -> List[str]:
-        results = []
+        results: List[Tuple[str, float]] = []
         with self._lock:
             if self.vertex_store:
                 try:
-                    vs = self.vertex_store.similarity_search_with_score(query, k=k*3)
-                    results += [(doc.page_content, score) for doc, score in vs]
-                except Exception:
-                    logger.exception("Vertex similarity search error")
+                    vs = self.vertex_store.similarity_search_with_score(query, k=max(1, k * 3))
+                    results += [(doc.page_content, float(score)) for doc, score in vs]
+                except Exception: logger.exception("Vertex search error")
             if self.legal_store:
                 try:
-                    ls = self.legal_store.similarity_search_with_score(query, k=k*3)
-                    results += [(doc.page_content, score) for doc, score in ls]
-                except Exception:
-                    logger.exception("Legal similarity search error")
+                    ls = self.legal_store.similarity_search_with_score(query, k=max(1, k * 3))
+                    results += [(doc.page_content, float(score)) for doc, score in ls]
+                except Exception: logger.exception("Legal search error")
+        
+        def jaccard(a: str, b: str) -> float:
+            A, B = set(a.lower().split()), set(b.lower().split())
+            return len(A & B) / max(1, len(A | B))
 
-        # Deduplication
-        def simple_sig(text: str, nwords: int = 12) -> str:
-            return " ".join(text.lower().split()[:nwords])
-
-        seen_sigs = []
-        unique_results = []
-        for text, score in sorted(results, key=lambda x: x[1], reverse=True):
-            sig = simple_sig(text)
-            if any(sig == s for s in seen_sigs):
-                continue
-            # jaccard check against seen_sigs' texts (approx)
-            def jaccard(a: str, b: str) -> float:
-                A, B = set(a.lower().split()), set(b.lower().split())
-                return len(A & B) / max(1, len(A | B))
-            if any(jaccard(text, stext) >= CONFIG.DEDUP_THRESHOLD for stext in seen_sigs):
-                continue
-            seen_sigs.append(text)
+        seen_texts: List[str] = []
+        unique_results: List[str] = []
+        for text, score in sorted(results, key=lambda x: -x[1]):
+            if any(jaccard(text, s) >= CONFIG.DEDUP_THRESHOLD for s in seen_texts): continue
+            seen_texts.append(text)
             unique_results.append(text)
-            if len(unique_results) >= k:
-                break
+            if len(unique_results) >= k: break
         return unique_results
 
-# -----------------------------------------------------------------------------
-# PROFILE MEMORY
-# -----------------------------------------------------------------------------
+# ---------- ProfileMemory ----------
 class ProfileMemory:
-    SAFE_KEYS = {"name", "age", "gender", "location", "profession", "organization", "interests", "email", "phone"}
-
+    SAFE_KEYS = {"name", "age", "gender", "location", "profession", "organization", "interests", "email", "phone", "language"}
     def __init__(self, path: Path):
-        self.path = Path(path)
-        if not self.path.exists():
-            self._write({})
+        self.path = path
+        if not self.path.exists(): self._write({})
         self._data = self._read()
+        self._lock = threading.RLock()
 
-    def _read(self) -> Dict[str, str]:
-        try:
-            return json.loads(self.path.read_text(encoding="utf-8"))
+    def _read(self) -> Dict[str, Any]:
+        try: return json.loads(self.path.read_text(encoding="utf-8"))
         except Exception:
-            logger.exception("Failed to read profile.json")
-            return {}
+            logger.exception("Failed to read profile.json"); return {}
 
-    def _write(self, data: Dict[str, str]):
-        try:
-            self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            logger.exception("Failed to write profile.json")
+    def _write(self, data: Dict[str, Any]):
+        try: self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception: logger.exception("Failed to write profile.json")
 
-    def set(self, key: str, value: str):
+    def set(self, key: str, value: Any):
         key = key.strip()
-        if key in self.SAFE_KEYS:
-            self._data[key] = value
-            self._write(self._data)
-        else:
-            self._data.setdefault("_extra", {})[key] = value
+        with self._lock:
+            if key in self.SAFE_KEYS: self._data[key] = value
+            else: self._data.setdefault("_extra", {})[key] = value
             self._write(self._data)
 
-    def get(self, key: str, default: Optional[str] = None) -> Optional[str]:
-        return self._data.get(key, default)
+    def update_from_dict(self, d: Dict[str, Any]):
+        if not isinstance(d, dict): return
+        with self._lock:
+            for k, v in d.items():
+                if k in self.SAFE_KEYS: self._data[k] = v
+                else: self._data.setdefault("_extra", {})[k] = v
+            self._write(self._data)
 
-    def all(self) -> Dict[str, str]:
-        return dict(self._data)
+    def get(self, key: str, default: Optional[Any] = None) -> Optional[Any]: return self._data.get(key, default)
+    def all(self) -> Dict[str, Any]: return dict(self._data)
 
-# -----------------------------------------------------------------------------
-# MEMORY STORE
-# -----------------------------------------------------------------------------
+# ---------- MemoryStore ----------
 class MemoryStore:
-    def __init__(self, mem_dir: Path, vs: Optional[DualVectorStore] = None):
-        self.mem_dir = Path(mem_dir)
-        self.mem_dir.mkdir(parents=True, exist_ok=True)
-        self.vs = vs or DualVectorStore(self.mem_dir)
+    def __init__(self, mem_dir: Path, vs: DualVectorStore, extractor_llm=None):
+        self.mem_dir = mem_dir
+        self.vs = vs
         self.fid = "chat_memory"
         self.buffer: List[Dict[str, Any]] = []
-        self.buffer_limit = 12
-        self.summarize_batch = 8
+        self.buffer_limit = CONFIG.SLIDING_WINDOW
+        self.summarize_batch = CONFIG.SUMMARIZE_BATCH
+        self._summ_queue: "queue.Queue[List[Dict]]" = queue.Queue()
+        self._summ_worker = threading.Thread(target=self._summarization_worker, daemon=True)
+        self.extractor_llm = extractor_llm
         try:
-            self.vs.build_or_load("__seed__", self.fid)
-        except Exception:
-            logger.exception("Failed to initialize memory vector stores")
+            self.vs._load_or_create_store(self.fid)
+            self._summ_worker.start()
+        except Exception: logger.exception("Failed to initialize memory vector stores")
 
-    def _truncated(self, role: str, content: str) -> str:
-        return f"{role}: {content[:CONFIG.MEMORY_TRUNCATE_CHARS]}"
+    def _truncated(self, role: str, content: str) -> str: return f"{role}: {content[:CONFIG.MEMORY_TRUNCATE_CHARS]}"
 
     def add(self, role: str, content: str):
-        entry = {"role": role, "text": content, "ts": datetime.utcnow().isoformat()}
+        entry = {"role": role, "text": content, "ts": datetime.now(timezone.utc).isoformat()}
         self.buffer.append(entry)
         short = self._truncated(role, content)
-        try:
-            if self.vs.vertex_store:
-                self.vs.vertex_store.add_texts([short])
-            if self.vs.legal_store:
-                self.vs.legal_store.add_texts([short])
-        except Exception:
-            logger.exception("Error adding truncated memory to vectorstores")
-
+        try: self.vs.add_doc_to_stores(Document(page_content=short, metadata={"type": "mem_truncate"}), self.fid)
+        except Exception: logger.exception("Error adding truncated memory to vectorstores")
         if len(self.buffer) > self.buffer_limit:
+            n = min(self.summarize_batch, len(self.buffer) - self.buffer_limit)
+            batch, self.buffer = self.buffer[:n], self.buffer[n:]
+            self._summ_queue.put(batch)
+
+    def _summarization_worker(self):
+        while True:
             try:
-                t = threading.Thread(target=self._summarize_and_persist_oldest, daemon=True)
-                t.start()
-            except Exception:
-                logger.exception("Failed to start summarization thread")
+                batch = self._summ_queue.get()
+                if batch is None: break
+                conv_blob = "\n".join([f"{e['role']}: {e['text']}" for e in batch])
+                summary = self._summarize_conv(conv_blob)
+                self.vs.add_doc_to_stores(Document(page_content=f"MEMORY_SUMMARY: {summary}", metadata={"type": "memory_summary"}), self.fid)
+                self.vs.save_all(self.fid)
+                self._summ_queue.task_done()
+            except Exception: logger.exception("Summarization worker error"); time.sleep(1)
 
-    def _summarize_and_persist_oldest(self):
-        if len(self.buffer) <= 0:
-            return
-        n = min(self.summarize_batch, len(self.buffer))
-        to_summarize = self.buffer[:n]
-        conv_lines = [f"{e['role']}: {e['text']}" for e in to_summarize]
-        conv_blob = "\n".join(conv_lines)
-
-        summarization_prompt = (
-            "Summarize the conversation below into one short, factual sentence capturing the user's intent or key decision. "
-            "Do not include personal identifiers.\n\n{text}"
-        )
-
-        summary = None
+    def _summarize_conv(self, text: str) -> str:
+        if not text.strip(): return "No content."
         try:
-            temp_llm = ChatVertexAI(model=CONFIG.MODEL_NAME, temperature=0.0, max_output_tokens=140)
-            pr = PromptTemplate(input_variables=["text"], template=summarization_prompt)
-            chain = LLMChain(llm=temp_llm, prompt=pr)
-            summary = chain.run({"text": conv_blob})
-            logger.info("Memory summary generated.")
-        except Exception:
-            logger.exception("Vertex summarization failed; using fallback short capture")
-            summary = " ; ".join(conv_lines[:2])[:200]
+            if self.extractor_llm:
+                prompt = f"Summarize the following conversation into one short, factual sentence. Do NOT include personal identifiers.\n\n{text}\n\nSummary:"
+                out = self.extractor_llm.invoke(prompt)
+                return out.content.strip() if hasattr(out, "content") else str(out).strip()[:400]
+        except Exception: logger.exception("Vertex summarization failed")
+        return (" ; ".join(text.splitlines()[:2]))[:400]
 
-        summary = (summary or "No summary generated.").strip()
-        label = f"MEMORY_SUMMARY: {summary}"
-
-        try:
-            if self.vs.vertex_store:
-                self.vs.vertex_store.add_texts([label])
-                self.vs.vertex_store.save_local(self.vs._vs_path(self.fid, "vertex").as_posix())
-            if self.vs.legal_store:
-                self.vs.legal_store.add_texts([label])
-                self.vs.legal_store.save_local(self.vs._vs_path(self.fid, "legal").as_posic())
-        except Exception:
-            # note: fallback if .as_posic() typo? ensure correct method - use as_posix()
-            try:
-                if self.vs.vertex_store:
-                    self.vs.vertex_store.save_local(self.vs._vs_path(self.fid, "vertex").as_posix())
-                if self.vs.legal_store:
-                    self.vs.legal_store.save_local(self.vs._vs_path(self.fid, "legal").as_posix())
-            except Exception:
-                logger.exception("Error writing memory summary to vectorstores")
-
-        # remove summarized items but keep last one as stubble
-        self.buffer = self.buffer[n - 1 :]
-
-    def retrieve(self, query: str, k: int) -> List[str]:
+    def retrieve(self, query: str, k: int, slider_k: int) -> List[str]:
         results = []
-        try:
-            results = self.vs.search(query, k=k)
-        except Exception:
-            logger.exception("MemoryStore retrieve error from vs.search")
-            results = []
-
-        recent_contexts = []
-        for e in reversed(self.buffer[-CONFIG.MEMORY_TOP_K :]):
-            recent_contexts.append(f"{e['role']}: {e['text']}")
-
+        try: results = self.vs.search(query, k=k)
+        except Exception: logger.exception("MemoryStore retrieve error")
+        recent_count = max(0, min(len(self.buffer), slider_k))
+        recent_contexts = [f"{e['role']}: {e['text']}" for e in self.buffer[-recent_count:]]
         merged = recent_contexts + results
         seen = set()
         final = []
         for item in merged:
-            key = item.strip()[:400]
-            if key not in seen:
-                final.append(item)
-                seen.add(key)
-            if len(final) >= k:
-                break
+            key = item.strip()[:500]
+            if key not in seen: final.append(item); seen.add(key)
+            if len(final) >= k: break
         return final
 
-# -----------------------------------------------------------------------------
-# WEB FALLBACK (DuckDuckGo HTML scraping) - optional, enabled by config flag
-# -----------------------------------------------------------------------------
-def duckduckgo_search_snippets(query: str, max_results: int = 3, timeout: int = 6) -> List[str]:
-    # We use DuckDuckGo HTML (no JS), parse titles/snippets
-    try:
-        base = "https://html.duckduckgo.com/html/"
-        params = {"q": query}
-        resp = requests.post(base, data=params, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
-        if resp.status_code != 200:
-            return []
-        soup = BeautifulSoup(resp.text, "html.parser")
-        snippets = []
-        results = soup.find_all("a", {"class": "result__a"})
-        containers = soup.find_all("div", {"class": "result__snippet"})
-        # prefer snippet containers; fallback to link text
-        for i in range(min(max_results, max(len(containers), len(results)))):
-            s = ""
-            if i < len(containers):
-                s = containers[i].get_text(separator=" ", strip=True)
-            elif i < len(results):
-                s = results[i].get_text(separator=" ", strip=True)
-            s = html.unescape(s)
-            if s:
-                snippets.append(s)
-            if len(snippets) >= max_results:
-                break
-        return snippets
-    except Exception:
-        logger.exception("DuckDuckGo web fetch failed")
-        return []
+    def shutdown(self):
+        try: self._summ_queue.put(None); self._summ_worker.join(timeout=5)
+        except Exception: pass
 
-# -----------------------------------------------------------------------------
-# QA ENGINE (multilingual, profile-safe, web-fallback optional, token monitoring)
-# -----------------------------------------------------------------------------
-class QAEngine:
-    def __init__(self, profile: ProfileMemory, use_web: bool = CONFIG.USE_WEB_FALLBACK):
-        self.profile = profile
-        self.use_web = use_web
-        self.llm = None
-        try:
-            self.llm = ChatVertexAI(model=CONFIG.MODEL_NAME, temperature=CONFIG.TEMPERATURE, max_output_tokens=CONFIG.MAX_OUTPUT_TOKENS)
-            logger.info("ChatVertexAI initialized for QA.")
-        except Exception:
-            logger.exception("ChatVertexAI init failed; LLM disabled.")
-            self.llm = None
+# ---------- LLM-based Profile Extractor ----------
+class ProfileExtractor:
+    def __init__(self, llm_client=None): self.llm = llm_client
 
-        self.prompt = PromptTemplate(
-            input_variables=["context", "history", "profile", "question", "lang_instruct", "web_results"],
-            template=(
-                "{lang_instruct}\n"
-                "You are a concise, accurate assistant. Use PROFILE for personalization; do not assume document entities are the user's identity.\n\n"
-                "PROFILE:\n{profile}\n\n"
-                "PAST (short):\n{history}\n\n"
-                "DOCUMENT SNIPPETS:\n{context}\n\n"
-                "WEB RESULTS (if any):\n{web_results}\n\n"
-                "QUESTION:\n{question}\n\n"
-                "Answer clearly and succinctly."
-            ),
-        )
-
-        self.extraction_prompt = PromptTemplate(
-            input_variables=["text"],
-            template=(
-                "Extract only explicit personal info from this user message. Return JSON with keys among: "
-                "name, age, gender, location, profession, organization, interests, email, phone. If none, return {}.\n\n"
-                "Message:\n{text}\n"
-            ),
-        )
-
-        self._chain_cache: Dict[str, LLMChain] = {}
-
-    def _get_chain(self, prompt: PromptTemplate) -> LLMChain:
-        key = prompt.template
-        if key in self._chain_cache:
-            return self._chain_cache[key]
-        if not self.llm:
-            raise RuntimeError("LLM not initialized")
-        chain = LLMChain(llm=self.llm, prompt=prompt)
-        self._chain_cache[key] = chain
-        return chain
-
-    def _lang_instruction(self, lang_code: str) -> str:
-        mapping = {
-            "en": "Respond in English.",
-            "hi": "हिंदी में उत्तर दें।",
-            "es": "Responde en Español.",
-            "fr": "Répondez en Français.",
-            "de": "Antworten Sie auf Deutsch.",
-            "bn": "বাংলায় উত্তর দিন।",
-            "ta": "தமிழில் பதில் அளியுங்கள்.",
-            "ru": "Ответьте на русском языке.",
-            "ar": "أجب باللغة العربية.",
-        }
-        return mapping.get(lang_code, "Respond in the user's language if possible; otherwise English.")
-
-    def extract_profile_info(self, user_input: str):
-        # Use LLM extraction when available; fallback to regex heuristics
-        if not user_input or not user_input.strip():
-            return
-        # Do not extract from documents; only call this when user message is the input
+    def extract(self, text: str) -> Dict[str, Any]:
+        text = text.strip()
+        if not text: return {}
         if self.llm:
             try:
-                chain = self._get_chain(self.extraction_prompt)
-                resp_text = chain.run({"text": user_input})
-                try:
-                    data = json.loads(resp_text)
-                    if isinstance(data, dict):
-                        for k, v in data.items():
-                            if v is None:
-                                continue
-                            if not isinstance(v, (str, int, float)):
-                                v = json.dumps(v, ensure_ascii=False)
-                            self.profile.set(str(k), str(v))
-                        logger.info("Profile updated from user input via LLM extractor: %s", list(data.keys()))
-                        return
-                except Exception:
-                    logger.debug("LLM profile extraction non-JSON output: %s", resp_text[:200])
-            except Exception:
-                logger.exception("Profile extraction LLM error (falling back)")
+                prompt = f"Extract user profile attributes from the message. Return ONLY valid JSON. Use keys: name, age, location, profession, interests.\n\nMessage:\n{text}\n\nJSON:"
+                out = self.llm.invoke(prompt)
+                raw = out.content.strip() if hasattr(out, "content") else str(out).strip()
+                start = raw.find("{"); end = raw.rfind("}") + 1
+                return json.loads(raw[start:end]) if start != -1 and end != 0 else {}
+            except Exception: logger.exception("LLM extraction failed, falling back to heuristic")
+        return {} # Simple fallback
 
-        # Fallback heuristics (simple)
-        txt = user_input.strip()
-        lowered = txt.lower()
-        # name heuristics: "i am X", "i'm X", "my name is X"
-        name_match = re.search(r"\b(?:i am|i'm|my name is)\s+([A-Z][a-zA-Z]{1,40})", txt)
-        if not name_match:
-            # try capitalized token after I am ignoring start-of-sentence lowercases
-            nm = re.search(r"(?:i am|i'm|my name is)\s+([^\s,\.]+)", lowered)
-            if nm:
-                candidate = nm.group(1).strip()
-                candidate = candidate.capitalize()
-                self.profile.set("name", candidate)
+# ---------- QA Engine ----------
+class QAEngine:
+    def __init__(self, profile: ProfileMemory, vs: DualVectorStore, memory: MemoryStore, llm_client=None):
+        self.profile, self.vs, self.memory, self.llm = profile, vs, memory, llm_client
+        if PromptTemplate:
+            self.prompt = PromptTemplate(input_variables=["context", "history", "profile", "question"], template="You are a concise, accurate assistant.\nPROFILE:\n{profile}\n\nRECENT:\n{history}\n\nCONTEXT:\n{context}\n\nQUESTION:\n{question}\n\nAnswer clearly.")
         else:
-            self.profile.set("name", name_match.group(1).strip())
+            self.prompt = "You are a concise, accurate assistant.\nPROFILE:\n{profile}\n\nRECENT:\n{history}\n\nCONTEXT:\n{context}\n\nQUESTION:\n{question}\n\nAnswer clearly."
 
-        # location heuristics: common city names or "i live in <place>"
-        loc_match = re.search(r"\b(?:i live in|i'm in|i am in|i live at)\s+([A-Za-z\s]{2,60})", lowered)
-        if loc_match:
-            candidate = loc_match.group(1).strip().title()
-            self.profile.set("location", candidate)
+    def answer(self, question: str, docs: List[str], memory_slider_val: int) -> Tuple[str, Dict[str, Any]]:
+        profile_json = json.dumps(compact_profile_for_prompt(self.profile.all()), ensure_ascii=False)
+        mem_results = self.memory.retrieve(question, k=CONFIG.MEMORY_TOP_K, slider_k=memory_slider_val)
+        history = "\n".join(mem_results[:CONFIG.MEMORY_TOP_K])
+        context = "\n".join([d[:CONFIG.CONTEXT_TRUNCATE_CHARS] for d in docs]) if docs else "No relevant documents."
+        
+        if PromptTemplate:
+            filled = self.prompt.format(context=context, history=history, profile=profile_json, question=question)
         else:
-            # detect city-like words (Chennai, Mumbai, Delhi etc.)
-            for city in ["chennai", "mumbai", "delhi", "bangalore", "kolkata", "hyderabad"]:
-                if city in lowered:
-                    self.profile.set("location", city.title())
-                    break
+            filled = self.prompt.replace("{context}", context).replace("{history}", history).replace("{profile}", profile_json).replace("{question}", question)
 
-    def detect_user_language(self, text: str) -> str:
-        if not text:
-            return "en"
-        if len(text) < 10:
-            return "en"
+        metrics = {"llm_tokens": TOKEN_MON.count_llm_tokens(filled), "emb_tokens": TOKEN_MON.count_bert_tokens(question)}
+        if not self.llm: return "LLM not initialized.", metrics
+        t0 = time.time()
         try:
-            return detect(text)
-        except Exception:
-            return "en"
+            out = self.llm.invoke(filled)
+            metrics["latency"] = time.time() - t0
+            return (out.content.strip() if hasattr(out, "content") else str(out).strip()), metrics
+        except Exception as e:
+            metrics["latency"] = time.time() - t0
+            logger.exception("LLM call failed")
+            return f"LLM invocation failed: {e}", metrics
 
-    def _get_web_context(self, query: str) -> str:
-        if not CONFIG.USE_WEB_FALLBACK or not self.use_web:
-            return ""
-        snippets = duckduckgo_search_snippets(query, max_results=CONFIG.MAX_WEB_RESULTS, timeout=CONFIG.WEB_TIMEOUT)
-        return "\n".join(snippets)
-
-    def answer(self, question: str, docs: List[str], memory: MemoryStore) -> Tuple[str, List[str]]:
-        # language detection
-        lang_code = self.detect_user_language(question or "")
-        lang_instruct = self._lang_instruction(lang_code)
-
-        # extract profile only from user messages
-        try:
-            self.extract_profile_info(question)
-        except Exception:
-            logger.exception("Profile extraction error in answer()")
-
-        # compact profile
-        compact_profile = compact_profile_for_prompt(self.profile.all())
-        profile_json = json.dumps(compact_profile, ensure_ascii=False)
-
-        # history + memory
-        history_items = memory.retrieve(question, CONFIG.MEMORY_TOP_K)
-        history = "\n".join(h[:CONFIG.CONTEXT_TRUNCATE_CHARS] for h in history_items)
-
-        # doc context truncated
-        truncated_docs = [d[:CONFIG.CONTEXT_TRUNCATE_CHARS] for d in docs] if docs else []
-        context = "\n".join(truncated_docs) if truncated_docs else "No relevant document snippets."
-
-        # web fallback context only if docs insufficient
-        web_results_text = ""
-        if CONFIG.USE_WEB_FALLBACK and self.use_web:
-            # if docs empty or short, attempt web fetch
-            if not docs or sum(len(d) for d in docs) < 120:
-                web_results_text = self._get_web_context(question)
-
-        # token monitoring
-        filled_prompt_preview = self.prompt.format(context=context, history=history, profile=profile_json, question=question, lang_instruct=lang_instruct, web_results=web_results_text)
-        llm_tokens = TOKEN_MON.count_llm_tokens(filled_prompt_preview)
-        emb_tokens = TOKEN_MON.count_bert_tokens(question)
-        warnings = TOKEN_MON.warnings_for(llm_tokens, emb_tokens)
-
-        if not self.llm:
-            logger.error("LLM not initialized.")
-            return ("LLM not initialized. Check Vertex credentials.", warnings)
-
-        chain = self._get_chain(self.prompt)
-        try:
-            out = chain.run({
-                "context": context,
-                "history": history,
-                "profile": profile_json,
-                "question": question,
-                "lang_instruct": lang_instruct,
-                "web_results": web_results_text,
-            })
-            return (out.strip(), warnings)
-        except Exception:
-            logger.exception("LLM chain run error")
-            try:
-                # fallback direct invocation
-                filled = self.prompt.format(context=context, history=history, profile=profile_json,
-                                            question=question, lang_instruct=lang_instruct, web_results=web_results_text)
-                out = self.llm.invoke(filled)
-                txt = getattr(out, "content", str(out)).strip()
-                return (txt, warnings)
-            except Exception:
-                logger.exception("LLM fallback invocation failed")
-                return ("Failed to produce an answer.", warnings)
-
-# -----------------------------------------------------------------------------
-# GUI (ttk) with threaded search/indexing and token warnings displayed in status
-# -----------------------------------------------------------------------------
-class AppGUI:
-    def __init__(self, root, vs: DualVectorStore, qa: QAEngine, memory: MemoryStore):
-        self.root = root
+# ---------- Indexing Manager ----------
+class IndexingManager:
+    def __init__(self, vs: DualVectorStore):
         self.vs = vs
-        self.qa = qa
-        self.memory = memory
-
-        self.root.title("⚖️ Legal AI Assistant")
-        self.root.geometry("980x650")
-        self.root.minsize(840, 520)
-
-        style = ttk.Style(self.root)
-        if "clam" in style.theme_names():
-            style.theme_use("clam")
-        style.configure("TButton", font=("Segoe UI", 10), padding=6)
-        style.configure("TLabel", font=("Segoe UI", 10))
-        style.configure("TEntry", font=("Segoe UI", 10))
-
-        # paned layout
-        self.pw = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
-        self.pw.pack(fill=tk.BOTH, expand=True)
-        self.sidebar = ttk.Frame(self.pw, padding=12)
-        self.pw.add(self.sidebar, weight=0)
-        self.main_frame = ttk.Frame(self.pw, padding=12)
-        self.pw.add(self.main_frame, weight=1)
-
-        # sidebar widgets
-        ttk.Label(self.sidebar, text="📂 Documents", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0,6))
-        ttk.Button(self.sidebar, text="Upload PDF", command=self.upload_pdf).pack(fill="x", pady=4)
-        ttk.Button(self.sidebar, text="Upload Image (PNG/JPG)", command=self.upload_image).pack(fill="x", pady=4)
-        ttk.Separator(self.sidebar, orient="horizontal").pack(fill="x", pady=10)
-
-        ttk.Label(self.sidebar, text="🗣 Query", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0,6))
-        self.query_entry = ttk.Entry(self.sidebar, width=36)
-        self.query_entry.pack(fill="x", pady=4)
-        ttk.Button(self.sidebar, text="Search", command=self.run_search_threaded).pack(fill="x", pady=8)
-
-        ttk.Label(self.sidebar, text="Force language (optional):", font=("Segoe UI", 9)).pack(anchor="w", pady=(8,2))
-        self.lang_var = tk.StringVar(value="")
-        lang_choices = ["", "en", "hi", "es", "fr", "de", "bn", "ta", "ru", "ar"]
-        self.lang_combo = ttk.Combobox(self.sidebar, values=lang_choices, textvariable=self.lang_var, state="readonly")
-        self.lang_combo.pack(fill="x")
-        ttk.Separator(self.sidebar, orient="horizontal").pack(fill="x", pady=10)
-
-        ttk.Label(self.sidebar, text="Profile (persisted):", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0,6))
-        self.profile_view = scrolledtext.ScrolledText(self.sidebar, height=10, width=36, wrap=tk.WORD, font=("Segoe UI", 9))
-        self.profile_view.pack(fill="both", pady=4)
-        self.profile_view.insert(tk.END, json.dumps(self.qa.profile.all(), ensure_ascii=False, indent=2))
-        self.profile_view.configure(state=tk.DISABLED)
-        ttk.Button(self.sidebar, text="Refresh Profile View", command=self.refresh_profile_view).pack(fill="x", pady=(6,0))
-
-        # main results
-        top_row = ttk.Frame(self.main_frame)
-        top_row.pack(fill="x")
-        ttk.Label(top_row, text="🔍 Results", font=("Segoe UI", 12, "bold")).pack(side=tk.LEFT, anchor="w")
-        self.clear_btn = ttk.Button(top_row, text="Clear", command=self.clear_results)
-        self.clear_btn.pack(side=tk.RIGHT)
-
-        self.result_box = scrolledtext.ScrolledText(self.main_frame, wrap=tk.WORD, font=("Consolas", 11))
-        self.result_box.pack(fill=tk.BOTH, expand=True, pady=8)
-
-        # status bar
-        self.status_var = tk.StringVar(value="Ready")
-        status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor="w", padding=4)
-        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
-
-        # indexing queue & workers
         self._index_queue = queue.Queue()
-        self._start_index_workers()
+        self._workers = [threading.Thread(target=self._worker, daemon=True) for _ in range(CONFIG.INDEX_THREADS)]
+        for w in self._workers: w.start()
 
-    def _start_index_workers(self):
-        def worker():
-            while True:
-                job = self._index_queue.get()
-                if job is None:
-                    break
-                text, fid = job
-                try:
-                    logger.info("Index worker processing %s", fid)
-                    self.vs.build_or_load(text, fid)
-                    logger.info("Index worker finished %s", fid)
-                except Exception:
-                    logger.exception("Index worker error")
-                finally:
-                    self._index_queue.task_done()
-        for _ in range(max(1, CONFIG.INDEX_THREADS)):
-            t = threading.Thread(target=worker, daemon=True)
-            t.start()
+    def enqueue(self, text: str, fid: str): self._index_queue.put((text, fid))
 
-    # UI helpers
-    def set_status(self, text: str):
-        self.status_var.set(text)
-        logger.info("STATUS: %s", text)
+    def _worker(self):
+        while True:
+            try:
+                text, fid = self._index_queue.get()
+                if fid is None: break
+                logger.info(f"Index worker processing {fid}")
+                self.vs.build_or_load(text, fid)
+                logger.info(f"Index worker finished {fid}")
+                self._index_queue.task_done()
+            except Exception: logger.exception("Index worker error")
 
-    def refresh_profile_view(self):
-        self.profile_view.configure(state=tk.NORMAL)
-        self.profile_view.delete(1.0, tk.END)
-        self.profile_view.insert(tk.END, json.dumps(self.qa.profile.all(), ensure_ascii=False, indent=2))
-        self.profile_view.configure(state=tk.DISABLED)
-        self.set_status("Profile refreshed.")
+    def shutdown(self):
+        for _ in self._workers: self._index_queue.put((None, None))
+        for w in self._workers: w.join(timeout=2)
 
-    def clear_results(self):
-        self.result_box.delete(1.0, tk.END)
-        self.set_status("Results cleared.")
+# ---------- Health Check ----------
+def check_health(llm_client, vertex_emb, legal_emb, vs: DualVectorStore) -> Dict[str, str]:
+    status = {}
+    try:
+        if llm_client: llm_client.invoke("ping"); status["LLM"] = "✅ OK"
+        else: status["LLM"] = "❌ Not initialized"
+    except Exception as e: status["LLM"] = f"❌ ERROR: {e}"
+    try:
+        if vertex_emb: vertex_emb.embed_query("health"); status["VertexAI Embeddings"] = "✅ OK"
+        else: status["VertexAI Embeddings"] = "❌ Disabled"
+    except Exception as e: status["VertexAI Embeddings"] = f"❌ ERROR: {e}"
+    try:
+        if legal_emb: legal_emb.embed_query("health"); status["LegalBERT Embeddings"] = "✅ OK"
+        else: status["LegalBERT Embeddings"] = "❌ Disabled"
+    except Exception as e: status["LegalBERT Embeddings"] = f"❌ ERROR: {e}"
+    try:
+        vs.search("health", k=1); status["FAISS Stores"] = "✅ OK"
+    except Exception as e: status["FAISS Stores"] = f"❌ ERROR: {e}"
+    try: status["StoresSizeMB"] = f"{folder_size_mb(Path(CONFIG.STORES_DIR)):.2f} MB"
+    except Exception: pass
+    logger.info(f"Health: {status}")
+    return status
 
-    # file upload
-    def upload_pdf(self):
-        file_path = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
-        if not file_path:
+# ==============================================================================
+# SECTION 3: TKINTER GUI APPLICATION
+# ==============================================================================
+
+class AppState:
+    """A class to hold the application's state, replacing st.session_state."""
+    def __init__(self):
+        self.vs: Optional[DualVectorStore] = None
+        self.profile: Optional[ProfileMemory] = None
+        self.extractor_llm: Optional[ChatVertexAI] = None
+        self.profile_extractor: Optional[ProfileExtractor] = None
+        self.memory: Optional[MemoryStore] = None
+        self.indexer: Optional[IndexingManager] = None
+        self.qa: Optional[QAEngine] = None
+        self.metrics = {
+            "tokens": [], "latencies": [], "buffer_sizes": [],
+            "store_sizes": [], "timestamps": []
+        }
+        self.chat_history: List[Tuple[str, str]] = []
+        self.last_health: Dict[str, str] = {}
+        self.memory_slider_val: int = CONFIG.SLIDING_WINDOW
+
+class LegalAIGUI(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Legal AI Assistant")
+        self.geometry("1400x900")
+
+        self.state = AppState()
+        self.response_queue = queue.Queue()
+
+        self.init_backend()
+        self.create_widgets()
+
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.update_log_display() # Start periodic log updates
+
+    def init_backend(self):
+        """Initialize all backend components."""
+        logger.info("Initializing backend components...")
+        self.state.vs = DualVectorStore(Path(CONFIG.STORES_DIR))
+        self.state.profile = ProfileMemory(Path(CONFIG.PROFILE_PATH))
+        
+        if ChatVertexAI:
+            try:
+                self.state.extractor_llm = ChatVertexAI(model=CONFIG.MODEL_NAME, temperature=0.0, max_output_tokens=512)
+                qa_llm = ChatVertexAI(model=CONFIG.MODEL_NAME, temperature=CONFIG.TEMPERATURE, max_output_tokens=CONFIG.MAX_OUTPUT_TOKENS)
+                logger.info("VertexAI LLMs initialized.")
+            except Exception as e:
+                logger.exception("LLM init failed.")
+                messagebox.showerror("LLM Error", f"Failed to initialize VertexAI LLMs: {e}\n\nPlease check your GOOGLE_APPLICATION_CREDENTIALS path and authentication.")
+                self.state.extractor_llm = None
+                qa_llm = None
+        else:
+            logger.error("ChatVertexAI not available from langchain.")
+            qa_llm = None
+        
+        self.state.profile_extractor = ProfileExtractor(llm_client=self.state.extractor_llm)
+        self.state.memory = MemoryStore(Path(CONFIG.MEMORY_DIR), vs=self.state.vs, extractor_llm=self.state.extractor_llm)
+        self.state.indexer = IndexingManager(self.state.vs)
+        self.state.qa = QAEngine(self.state.profile, self.state.vs, self.state.memory, llm_client=qa_llm)
+        logger.info("Backend initialization complete.")
+        
+        # Register cleanup functions
+        atexit.register(self.on_closing)
+
+    def create_widgets(self):
+        """Create and layout all GUI widgets."""
+        # Main layout: Paned window for resizable columns
+        main_pane = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        main_pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # --- Sidebar (Left) ---
+        sidebar_frame = ttk.Frame(main_pane, width=350)
+        main_pane.add(sidebar_frame, weight=1)
+        self._create_sidebar_widgets(sidebar_frame)
+
+        # --- Main content (Right): Another paned window for chat and dashboard ---
+        content_pane = ttk.PanedWindow(main_pane, orient=tk.HORIZONTAL)
+        main_pane.add(content_pane, weight=4)
+
+        chat_frame = ttk.Frame(content_pane, width=600)
+        dashboard_frame = ttk.Frame(content_pane, width=450)
+        content_pane.add(chat_frame, weight=2)
+        content_pane.add(dashboard_frame, weight=1)
+
+        self._create_chat_widgets(chat_frame)
+        self._create_dashboard_widgets(dashboard_frame)
+
+    def _create_sidebar_widgets(self, parent):
+        parent.grid_rowconfigure(5, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        # Controls
+        controls_frame = ttk.LabelFrame(parent, text="Controls")
+        controls_frame.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
+        ttk.Button(controls_frame, text="Run Health Check", command=self.handle_run_health_check).pack(fill=tk.X, padx=5, pady=5)
+        ttk.Button(controls_frame, text="Upload Document", command=self.handle_upload_file).pack(fill=tk.X, padx=5, pady=5)
+        ttk.Button(controls_frame, text="Force Save FAISS", command=self.handle_force_save_faiss).pack(fill=tk.X, padx=5, pady=5)
+
+        # Profile
+        profile_frame = ttk.LabelFrame(parent, text="Profile")
+        profile_frame.grid(row=1, column=0, sticky="ew", padx=5, pady=5)
+        ttk.Label(profile_frame, text="Name:").grid(row=0, column=0, sticky="w", padx=5, pady=2)
+        self.profile_name_var = tk.StringVar()
+        ttk.Entry(profile_frame, textvariable=self.profile_name_var).grid(row=0, column=1, sticky="ew", padx=5, pady=2)
+        ttk.Label(profile_frame, text="Profession:").grid(row=1, column=0, sticky="w", padx=5, pady=2)
+        self.profile_prof_var = tk.StringVar()
+        ttk.Entry(profile_frame, textvariable=self.profile_prof_var).grid(row=1, column=1, sticky="ew", padx=5, pady=2)
+        ttk.Label(profile_frame, text="Interests:").grid(row=2, column=0, sticky="w", padx=5, pady=2)
+        self.profile_int_var = tk.StringVar()
+        ttk.Entry(profile_frame, textvariable=self.profile_int_var).grid(row=2, column=1, sticky="ew", padx=5, pady=2)
+        ttk.Button(profile_frame, text="Save Profile", command=self.handle_save_profile).grid(row=3, columnspan=2, pady=5)
+        self.refresh_profile_display()
+
+        # Memory
+        memory_frame = ttk.LabelFrame(parent, text="Memory & Retrieval")
+        memory_frame.grid(row=2, column=0, sticky="ew", padx=5, pady=5)
+        ttk.Label(memory_frame, text="Memory Window (Recent Messages):", wraplength=300).pack(fill=tk.X, padx=5)
+        self.memory_slider = ttk.Scale(memory_frame, from_=0, to=50, orient=tk.HORIZONTAL, command=self.on_slider_change)
+        self.memory_slider.set(self.state.memory_slider_val)
+        self.memory_slider.pack(fill=tk.X, padx=5, pady=5)
+
+        # Log Download
+        log_frame = ttk.LabelFrame(parent, text="Logs")
+        log_frame.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
+        ttk.Button(log_frame, text="Download Log File", command=self.handle_download_logs).pack(fill=tk.X, padx=5, pady=5)
+
+    def _create_chat_widgets(self, parent):
+        parent.grid_rowconfigure(0, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        # Chat display
+        self.chat_display = scrolledtext.ScrolledText(parent, wrap=tk.WORD, state="disabled", font=("Helvetica", 11))
+        self.chat_display.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=5, pady=5)
+        self.chat_display.tag_config("user", foreground="blue", font=("Helvetica", 11, "bold"))
+        self.chat_display.tag_config("assistant", foreground="black")
+
+        # User input
+        self.user_input_var = tk.StringVar()
+        input_entry = ttk.Entry(parent, textvariable=self.user_input_var, font=("Helvetica", 11))
+        input_entry.grid(row=1, column=0, sticky="ew", padx=5, pady=5)
+        input_entry.bind("<Return>", lambda event: self.handle_send_message())
+        
+        send_button = ttk.Button(parent, text="Send", command=self.handle_send_message)
+        send_button.grid(row=1, column=1, sticky="ew", padx=5, pady=5)
+
+    def _create_dashboard_widgets(self, parent):
+        parent.grid_columnconfigure(0, weight=1)
+
+        # Health
+        health_frame = ttk.LabelFrame(parent, text="Monitoring Dashboard")
+        health_frame.grid(row=0, column=0, sticky="new", padx=5, pady=5)
+        self.health_label = ttk.Label(health_frame, text="Run health check to see status.", justify=tk.LEFT, wraplength=400)
+        self.health_label.pack(fill=tk.X, padx=5, pady=5)
+
+        # Charts
+        charts_notebook = ttk.Notebook(parent)
+        charts_notebook.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+        parent.grid_rowconfigure(1, weight=1)
+
+        if MATPLOTLIB_AVAILABLE:
+            self.charts = {}
+            chart_specs = [
+                ("Tokens", "LLM Tokens per Request", "requests", "tokens"),
+                ("Latency", "LLM Latency (s)", "requests", "seconds"),
+                ("Buffer", "Memory Buffer Size", "requests", "size"),
+                ("Store", "FAISS Stores Size (MB)", "requests", "MB")
+            ]
+            for key, title, xlabel, ylabel in chart_specs:
+                tab = ttk.Frame(charts_notebook)
+                charts_notebook.add(tab, text=key)
+                fig = Figure(figsize=(5, 2.5), dpi=100)
+                ax = fig.add_subplot(111)
+                ax.set_title(title, fontsize=10)
+                ax.set_xlabel(xlabel, fontsize=8)
+                ax.set_ylabel(ylabel, fontsize=8)
+                ax.grid(True)
+                fig.tight_layout()
+                canvas = FigureCanvasTkAgg(fig, master=tab)
+                canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+                self.charts[key] = {'fig': fig, 'ax': ax, 'canvas': canvas}
+        else:
+            charts_notebook.add(ttk.Label(charts_notebook, text="Matplotlib not installed. Charts are disabled."), text="Charts")
+
+        # Logs
+        log_frame = ttk.LabelFrame(parent, text="Logs (tail)")
+        log_frame.grid(row=2, column=0, sticky="sew", padx=5, pady=5)
+        parent.grid_rowconfigure(2, weight=1) # Allow log to expand
+        self.log_display = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, state="disabled", height=10, font=("Courier New", 9))
+        self.log_display.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+    # --- Handlers and UI Update Methods ---
+    
+    def on_slider_change(self, value):
+        self.state.memory_slider_val = int(float(value))
+        if self.state.memory:
+            self.state.memory.buffer_limit = self.state.memory_slider_val if self.state.memory_slider_val > 0 else CONFIG.SLIDING_WINDOW
+
+    def handle_send_message(self):
+        question = self.user_input_var.get().strip()
+        if not question:
             return
+        
+        self.user_input_var.set("")
+        self.add_message_to_chat("User", question)
+        self.state.chat_history.append(("User", question))
+        if self.state.memory: self.state.memory.add("user", question)
+        
+        # Run QA in a separate thread to not freeze the GUI
+        threading.Thread(target=self._process_question_thread, args=(question,), daemon=True).start()
+        self.after(100, self.check_response_queue)
+
+    def _process_question_thread(self, question: str):
+        if not self.state.qa or not self.state.vs or not self.state.profile_extractor:
+            self.response_queue.put(("Error: QA engine not initialized.", {}))
+            return
+
         try:
-            extractor = Extractor(Path(CONFIG.CACHE_DIR))
-            text = extractor.from_pdf(file_path)
-            fid = Path(file_path).stem
-            self._index_queue.put((text, fid))
-            messagebox.showinfo("Success", f"PDF '{fid}' enqueued for indexing.")
-            self.set_status(f"PDF '{fid}' enqueued.")
+            extracted = self.state.profile_extractor.extract(question)
+            if extracted:
+                self.state.profile.update_from_dict(extracted)
+                logger.info("Profile updated with keys: %s", list(extracted.keys()))
+                self.after(0, self.refresh_profile_display) # Update GUI from main thread
         except Exception:
-            logger.exception("PDF upload error")
-            messagebox.showerror("Error", "Failed to enqueue PDF for indexing.")
-            self.set_status("Error while uploading PDF.")
+            logger.exception("Profile extraction error")
+            
+        docs = self.state.vs.search(question, k=CONFIG.TOP_K)
+        answer, metrics = self.state.qa.answer(question, docs, memory_slider_val=self.state.memory_slider_val)
+        self.response_queue.put((answer, metrics))
 
-    def upload_image(self):
-        file_path = filedialog.askopenfilename(filetypes=[("Image files", "*.png;*.jpg;*.jpeg")])
-        if not file_path:
-            return
+    def check_response_queue(self):
         try:
-            extractor = Extractor(Path(CONFIG.CACHE_DIR))
-            text = extractor.from_image(file_path)
-            fid = Path(file_path).stem
-            self._index_queue.put((text, fid))
-            messagebox.showinfo("Success", f"Image '{fid}' enqueued for indexing.")
-            self.set_status(f"Image '{fid}' enqueued.")
-        except Exception:
-            logger.exception("Image upload error")
-            messagebox.showerror("Error", "Failed to enqueue image for indexing.")
-            self.set_status("Error while uploading image.")
+            answer, metrics = self.response_queue.get_nowait()
+            self.add_message_to_chat("Assistant", answer)
+            self.state.chat_history.append(("Assistant", answer))
+            if self.state.memory: self.state.memory.add("assistant", answer)
 
-    # search (threaded)
-    def run_search_threaded(self):
-        q = self.query_entry.get().strip()
-        if not q:
-            messagebox.showwarning("Input Error", "Please enter a query.")
+            # Update metrics
+            ts = time.time()
+            self.state.metrics["tokens"].append(metrics.get("llm_tokens", 0))
+            self.state.metrics["latencies"].append(metrics.get("latency", 0.0))
+            self.state.metrics["buffer_sizes"].append(len(self.state.memory.buffer) if self.state.memory else 0)
+            self.state.metrics["store_sizes"].append(folder_size_mb(Path(CONFIG.STORES_DIR)))
+            self.state.metrics["timestamps"].append(ts)
+            self.update_dashboard()
+
+        except queue.Empty:
+            self.after(100, self.check_response_queue)
+    
+    def handle_upload_file(self):
+        filepath = filedialog.askopenfilename(
+            title="Select a document",
+            filetypes=[("All Files", "*.*"), ("PDF", "*.pdf"), ("Text", "*.txt"), ("Word", "*.docx"), ("JSON", "*.json"), ("Images", "*.png *.jpg *.jpeg")]
+        )
+        if not filepath:
             return
-        threading.Thread(target=self._run_search, args=(q,), daemon=True).start()
 
-    def _run_search(self, query: str):
-        self.set_status("Searching...")
+        path = Path(filepath)
+        extractor = Extractor(Path(CONFIG.CACHE_DIR))
+        text = ""
+        suffix = path.suffix.lower()
+
         try:
-            self.memory.add("User", query)
-            docs = self.vs.search(query, k=CONFIG.TOP_K)
-            forced_lang = (self.lang_var.get() or "").strip()
-            if forced_lang:
-                query_for_llm = f"(Reply language: {forced_lang})\n\n{query}"
+            if suffix == ".pdf": text = extractor.from_pdf(str(path))
+            elif suffix in {".txt", ".md"}: text = extractor.from_text(str(path))
+            elif suffix == ".docx": text = extractor.from_docx(str(path))
+            elif suffix == ".json": text = extractor.from_json(str(path))
+            elif suffix in {".png", ".jpg", ".jpeg"}: text = extractor.from_image(str(path))
             else:
-                query_for_llm = query
-
-            ans, warnings = self.qa.answer(query_for_llm, docs, self.memory)
-            self.memory.add("Assistant", ans)
-
-            # display
-            self.result_box.delete(1.0, tk.END)
-            self.result_box.insert(tk.END, "Answer:\n\n" + ans + "\n\n")
-            if docs:
-                self.result_box.insert(tk.END, "-" * 60 + "\nDocument snippets used:\n\n")
-                for i, d in enumerate(docs, 1):
-                    snippet = (d[:1000] + "...") if len(d) > 1000 else d
-                    self.result_box.insert(tk.END, f"[Doc {i}]: {snippet}\n\n")
-
-            # profile refresh
-            self.refresh_profile_view()
-
-            # status + warnings
-            if warnings:
-                self.set_status(" ; ".join(warnings))
+                messagebox.showwarning("Unsupported Type", f"Unsupported file type: {suffix}")
+                return
+            
+            if text and self.state.indexer:
+                fid = path.stem
+                self.state.indexer.enqueue(text, fid)
+                self.add_message_to_chat("System", f"Enqueued {path.name} for indexing as {fid}.")
             else:
-                self.set_status("Answer generated successfully.")
-        except Exception:
-            logger.exception("Search error")
-            messagebox.showerror("Error", "An error occurred during search.")
-            self.set_status("Error during search.")
+                self.add_message_to_chat("System", f"Could not extract text from {path.name}.")
+        except Exception as e:
+            logger.exception("File processing failed")
+            messagebox.showerror("File Error", f"Failed to process file: {e}")
 
-# -----------------------------------------------------------------------------
-# MAIN
-# -----------------------------------------------------------------------------
-def main():
-    logger.info("Starting Legal AI Assistant (integrated).")
-    memory = MemoryStore(Path(CONFIG.MEMORY_DIR))
-    profile = ProfileMemory(Path(CONFIG.PROFILE_PATH))
-    vs = DualVectorStore(Path(CONFIG.DATA_DIR))
-    qa = QAEngine(profile, use_web=CONFIG.USE_WEB_FALLBACK)
+    def handle_save_profile(self):
+        if not self.state.profile: return
+        self.state.profile.set("name", self.profile_name_var.get())
+        self.state.profile.set("profession", self.profile_prof_var.get())
+        interests = [s.strip() for s in self.profile_int_var.get().split(",") if s.strip()]
+        self.state.profile.set("interests", interests)
+        messagebox.showinfo("Profile", "Profile saved successfully.")
 
-    logger.info("Profile loaded: %s", profile.all())
+    def handle_run_health_check(self):
+        if not self.state.qa: return
+        self.state.last_health = check_health(self.state.qa.llm, self.state.vs.vertex_emb, self.state.vs.legal_emb, self.state.vs)
+        health_text = "\n".join([f"- {k}: {v}" for k, v in self.state.last_health.items()])
+        self.health_label.config(text=health_text)
 
-    root = tk.Tk()
-    app = AppGUI(root, vs, qa, memory)
-    root.mainloop()
+    def handle_force_save_faiss(self):
+        try:
+            if self.state.vs:
+                self.state.vs.save_all("global_docs")
+                self.state.vs.save_all("chat_memory")
+                messagebox.showinfo("Success", "FAISS stores saved.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save FAISS stores: {e}")
+            
+    def handle_download_logs(self):
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".log",
+            initialfile=logfile.name,
+            filetypes=[("Log Files", "*.log"), ("All files", "*.*")]
+        )
+        if save_path:
+            try:
+                import shutil
+                shutil.copy(logfile, save_path)
+                messagebox.showinfo("Success", f"Log file saved to {save_path}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not save log file: {e}")
+
+    def add_message_to_chat(self, role, text):
+        self.chat_display.config(state="normal")
+        if role.lower() == "user":
+            self.chat_display.insert(tk.END, "You: ", "user")
+        elif role.lower() == "assistant":
+            self.chat_display.insert(tk.END, "Assistant: ", "assistant_role")
+        else: # System
+            self.chat_display.insert(tk.END, f"{role}: ", ("system", "bold"))
+
+        self.chat_display.insert(tk.END, f"{text}\n\n")
+        self.chat_display.config(state="disabled")
+        self.chat_display.see(tk.END)
+
+    def update_log_display(self):
+        log_tail = tail_log_lines(logfile, n=200)
+        self.log_display.config(state="normal")
+        self.log_display.delete(1.0, tk.END)
+        self.log_display.insert(tk.END, log_tail)
+        self.log_display.config(state="disabled")
+        self.log_display.see(tk.END)
+        self.after(5000, self.update_log_display) # Refresh every 5 seconds
+
+    def update_dashboard(self):
+        if not MATPLOTLIB_AVAILABLE: return
+        metrics = self.state.metrics
+        
+        # Tokens
+        ax = self.charts["Tokens"]["ax"]
+        ax.clear()
+        ax.plot(metrics["tokens"], marker='o', linestyle='-', markersize=4)
+        ax.set_title("LLM Tokens per Request", fontsize=10)
+        ax.grid(True)
+        self.charts["Tokens"]["canvas"].draw()
+        
+        # Latency
+        ax = self.charts["Latency"]["ax"]
+        ax.clear()
+        ax.plot(metrics["latencies"], marker='o', linestyle='-', markersize=4, color='orange')
+        ax.set_title("LLM Latency (s)", fontsize=10)
+        ax.grid(True)
+        self.charts["Latency"]["canvas"].draw()
+
+        # Buffer
+        ax = self.charts["Buffer"]["ax"]
+        ax.clear()
+        ax.bar(range(len(metrics["buffer_sizes"])), metrics["buffer_sizes"], color='green')
+        ax.set_title("Memory Buffer Size", fontsize=10)
+        ax.grid(True)
+        self.charts["Buffer"]["canvas"].draw()
+
+        # Store Size
+        ax = self.charts["Store"]["ax"]
+        ax.clear()
+        ax.plot(metrics["store_sizes"], marker='.', linestyle='-', markersize=4, color='red')
+        ax.set_title("FAISS Stores Size (MB)", fontsize=10)
+        ax.grid(True)
+        self.charts["Store"]["canvas"].draw()
+
+    def refresh_profile_display(self):
+        if not self.state.profile: return
+        profile_data = self.state.profile.all()
+        self.profile_name_var.set(profile_data.get("name", ""))
+        self.profile_prof_var.set(profile_data.get("profession", ""))
+        interests = profile_data.get("interests", [])
+        if isinstance(interests, list):
+            self.profile_int_var.set(", ".join(interests))
+        else:
+            self.profile_int_var.set(interests or "")
+            
+    def on_closing(self):
+        """Handle graceful shutdown of background processes."""
+        logger.info("Shutdown sequence initiated...")
+        if self.state.memory: self.state.memory.shutdown()
+        if self.state.indexer: self.state.indexer.shutdown()
+        if self.state.vs:
+            self.state.vs.save_all("global_docs")
+            self.state.vs.save_all("chat_memory")
+        logger.info("Shutdown complete. Exiting.")
+        self.destroy()
 
 if __name__ == "__main__":
-    main()
+    TOKEN_MON = TokenMonitor()
+    app = LegalAIGUI()
+    app.mainloop()
