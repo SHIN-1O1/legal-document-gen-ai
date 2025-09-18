@@ -12,10 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Set
 
 # ---- Third-party deps ----
-from PIL import Image, ImageEnhance
-import pytesseract
-import fitz  # PyMuPDF for hybrid PDF extraction
-import io
+import fitz  # PyMuPDF for PDF extraction
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.prompts import PromptTemplate
@@ -27,7 +24,7 @@ from langchain_google_vertexai import VertexAIEmbeddings, ChatVertexAI
 # ---- GUI ----
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
-
+from tkinter import ttk  
 # =============================================================================
 # CONFIG
 # =============================================================================
@@ -91,28 +88,15 @@ def file_fingerprint(path: str) -> str:
         return hashlib.md5(path.encode()).hexdigest()
 
 # =============================================================================
-# EXTRACTOR (with Hybrid PDF-Image OCR)
+# EXTRACTOR (Text-Only PDF)
 # =============================================================================
 
 class Extractor:
     def __init__(self, cache_dir: Path):
         self.cache_dir = cache_dir
 
-    def _perform_ocr(self, image_bytes: bytes) -> str:
-        """Helper function to perform OCR on image bytes."""
-        text = ""
-        try:
-            with Image.open(io.BytesIO(image_bytes)) as im:
-                if im.mode != "L": im = im.convert("L")
-                im = ImageEnhance.Contrast(im).enhance(1.8)
-                im = ImageEnhance.Sharpness(im).enhance(1.8)
-                text = pytesseract.image_to_string(im, config="--oem 3 --psm 6", lang="eng") or ""
-        except Exception as e:
-            logger.error(f"OCR processing failed: {e}")
-        return text.strip()
-
     def from_pdf(self, pdf_path: str) -> str:
-        """Extracts both digital text and OCR'd text from images within a PDF."""
+        """Extracts digital text from a PDF."""
         fid = file_fingerprint(pdf_path)
         cpath = self.cache_dir / f"extract_{fid}.txt"
         if cpath.exists():
@@ -124,26 +108,9 @@ class Extractor:
                 for i, page in enumerate(doc, start=1):
                     page_content = [f"\n--- Page {i} ---"]
                     
-                    # 1. Extract digital text
                     digital_text = page.get_text().strip()
                     if digital_text:
                         page_content.append(digital_text)
-                    
-                    # 2. Extract images and perform OCR
-                    image_list = page.get_images(full=True)
-                    if image_list:
-                        ocr_texts = []
-                        for img_index, img in enumerate(image_list):
-                            xref = img[0]
-                            base_image = doc.extract_image(xref)
-                            image_bytes = base_image["image"]
-                            
-                            ocr_text = self._perform_ocr(image_bytes)
-                            if ocr_text:
-                                ocr_texts.append(ocr_text)
-                        
-                        if ocr_texts:
-                            page_content.append("\n--- OCR Text from Images ---\n" + "\n".join(ocr_texts))
                     
                     text_parts.append("\n".join(page_content))
 
@@ -157,32 +124,7 @@ class Extractor:
         try:
             cpath.write_text(text, encoding="utf-8")
         except Exception:
-            logger.exception("Failed to cache hybrid PDF extraction %s", cpath)
-            
-        return text
-
-    def from_image(self, image_path: str) -> str:
-        """Extracts text from a standalone image file using OCR."""
-        fid = file_fingerprint(image_path)
-        cpath = self.cache_dir / f"extract_{fid}.txt"
-        if cpath.exists():
-            return cpath.read_text(encoding="utf-8")
-        
-        try:
-            with open(image_path, "rb") as f:
-                image_bytes = f.read()
-            text = self._perform_ocr(image_bytes)
-        except Exception:
-            logger.exception("Image file reading error for %s", image_path)
-            text = ""
-        
-        if not text.strip():
-            text = "No readable text found."
-            
-        try:
-            cpath.write_text(text, encoding="utf-8")
-        except Exception:
-            logger.exception("Failed to cache image extraction %s", cpath)
+            logger.exception("Failed to cache PDF extraction %s", cpath)
             
         return text
 
@@ -216,7 +158,6 @@ class DualVectorStore:
 
     def _load_or_create_unified_stores(self):
         with self._lock:
-            # Vertex Store
             v_path = self.base_dir / f"vs_vertex_{self.doc_store_name}"
             if v_path.exists() and self.vertex_emb:
                 logger.info("Loading existing unified Vertex document store...")
@@ -225,7 +166,6 @@ class DualVectorStore:
                 logger.info("Creating new unified Vertex document store.")
                 self.doc_vertex_store = FAISS.from_texts(["init"], self.vertex_emb)
 
-            # Legal Store
             l_path = self.base_dir / f"vs_legal_{self.doc_store_name}"
             if l_path.exists() and self.legal_emb:
                 logger.info("Loading existing unified Legal-BERT document store...")
@@ -253,36 +193,35 @@ class DualVectorStore:
                 l_path = self.base_dir / f"vs_legal_{self.doc_store_name}"
                 self.doc_legal_store.save_local(l_path.as_posix())
 
-        def search(self, query: str, k: int, doc_filter: Optional[str] = None) -> List[str]:
-            results: List[Tuple[Document, float]] = []
-            with self._lock:
-                if self.doc_vertex_store:
-                    results.extend(self.doc_vertex_store.similarity_search_with_score(query, k=max(1, k * 2)))
-                if self.doc_legal_store:
-                    results.extend(self.doc_legal_store.similarity_search_with_score(query, k=max(1, k * 2)))
+    def search(self, query: str, k: int, doc_filter: Optional[str] = None) -> List[str]:
+        results: List[Tuple[Document, float]] = []
+        with self._lock:
+            if self.doc_vertex_store:
+                results.extend(self.doc_vertex_store.similarity_search_with_score(query, k=max(1, k * 2)))
+            if self.doc_legal_store:
+                results.extend(self.doc_legal_store.similarity_search_with_score(query, k=max(1, k * 2)))
 
-            def jaccard(a: str, b: str) -> float:
-                A, B = set(a.lower().split()), set(b.lower().split())
-                return len(A & B) / max(1, len(A | B))
+        def jaccard(a: str, b: str) -> float:
+            A, B = set(a.lower().split()), set(b.lower().split())
+            return len(A & B) / max(1, len(A | B))
 
-            seen_texts, unique_results = [], []
-            for doc, score in sorted(results, key=lambda x: x[1]):
-                source = doc.metadata.get('source', 'Unknown')
+        seen_texts, unique_results = [], []
+        for doc, score in sorted(results, key=lambda x: x[1]):
+            source = doc.metadata.get('source', 'Unknown')
 
-                if doc_filter and doc_filter.lower() not in source.lower():
-                    continue
+            if doc_filter and doc_filter.lower() != source.lower():
+                continue
 
-                page_content = doc.page_content
-                if any(jaccard(page_content, s) >= CONFIG.DEDUP_THRESHOLD for s in seen_texts):
-                    continue
+            page_content = doc.page_content
+            if any(jaccard(page_content, s) >= CONFIG.DEDUP_THRESHOLD for s in seen_texts):
+                continue
 
-                formatted_content = f"Source: {source}\n\n{page_content}"
-                seen_texts.append(page_content)
-                unique_results.append(formatted_content)
-                if len(unique_results) >= k:
-                    break
-            return unique_results
-
+            formatted_content = f"Source: {source}\n\n{page_content}"
+            seen_texts.append(page_content)
+            unique_results.append(formatted_content)
+            if len(unique_results) >= k:
+                break
+        return unique_results
 
 # =============================================================================
 # MEMORY STORE
@@ -371,12 +310,12 @@ class IndexingManager:
         for w in self._workers: w.join(timeout=2)
 
 # =============================================================================
-# GUI APPLICATION (with Unified Uploader)
+# GUI APPLICATION
 # =============================================================================
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Legal Assistant — Unified Uploader")
+        self.root.title("Legal Assistant")
         self.root.geometry("1000x700")
 
         self.extractor = Extractor(Path(CONFIG.CACHE_DIR))
@@ -385,7 +324,9 @@ class App:
         self.memory = MemoryStore()
         self.indexer = IndexingManager(self.vs)
         
-        self.indexed_files: Set[str] = set()
+        self.indexed_docs: Dict[str, str] = {}
+        # **NEW**: Variable to track the most recently loaded document name
+        self.latest_doc_name: Optional[str] = None
         self.busy = False
         
         self._setup_gui()
@@ -395,15 +336,27 @@ class App:
         top_frame = tk.Frame(self.root)
         top_frame.pack(fill="x", padx=8, pady=8)
 
-        tk.Button(top_frame, text="Load Document", command=self.load_document).pack(side="left")
+        tk.Button(top_frame, text="Load PDF Document", command=self.load_document).pack(side="left")
         tk.Button(top_frame, text="Clear Chat", command=self.clear_chat).pack(side="left", padx=6)
+        
+        tk.Label(top_frame, text="Search in:").pack(side="left", padx=(10, 2))
+        self.doc_filter_var = tk.StringVar()
+        self.doc_filter_combo = ttk.Combobox(
+            top_frame,
+            textvariable=self.doc_filter_var,
+            state="readonly",
+            width=30
+        )
+        self.doc_filter_combo['values'] = ['All Documents']
+        self.doc_filter_var.set('All Documents')
+        self.doc_filter_combo.pack(side="left")
 
-        self.status = tk.StringVar(value="Ready. Load a document to begin.")
+        self.status = tk.StringVar(value="Ready. Load a PDF document to begin.")
         tk.Label(top_frame, textvariable=self.status, anchor="w").pack(side="left", padx=20)
 
         self.chat = scrolledtext.ScrolledText(self.root, wrap=tk.WORD, height=25)
         self.chat.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        self.chat_insert_system("Loaded. Use 'Load Document' to add PDFs or images to the knowledge base.")
+        self.chat_insert_system("Loaded. Use 'Load PDF Document' to add files to the knowledge base.")
 
         bottom_frame = tk.Frame(self.root)
         bottom_frame.pack(fill="x", padx=8, pady=8)
@@ -447,41 +400,25 @@ class App:
     def load_document(self):
         if self.busy: return
         
-        filetypes = [
-            ("All Supported Files", "*.pdf *.png *.jpg *.jpeg"),
-            ("PDF Documents", "*.pdf"),
-            ("Image Files", "*.png *.jpg *.jpeg"),
-            ("All Files", "*.*")
-        ]
-        path_str = filedialog.askopenfilename(title="Select a Document or Image", filetypes=filetypes)
+        filetypes = [("PDF Documents", "*.pdf"), ("All Files", "*.*")]
+        path_str = filedialog.askopenfilename(title="Select a PDF Document", filetypes=filetypes)
         if not path_str: return
 
         path = Path(path_str)
-        file_extension = path.suffix.lower()
-        file_type = ""
-
-        if file_extension == ".pdf":
-            file_type = "pdf"
-        elif file_extension in [".png", ".jpg", ".jpeg"]:
-            file_type = "image"
-        else:
-            messagebox.showwarning("Unsupported File", f"The file type '{file_extension}' is not supported.")
+        if path.suffix.lower() != ".pdf":
+            messagebox.showwarning("Unsupported File", "Only PDF files are supported.")
             return
             
-        threading.Thread(target=self._load_worker, args=(str(path), file_type), daemon=True).start()
+        threading.Thread(target=self._load_worker, args=(str(path),), daemon=True).start()
 
-    def _load_worker(self, path: str, file_type: str):
+    def _load_worker(self, path: str):
         fid = file_fingerprint(path)
-        if fid in self.indexed_files:
+        if fid in self.indexed_docs:
             self.chat_insert_system(f"File '{Path(path).name}' has already been indexed in this session.")
             return
 
         self.set_busy(True, f"Extracting text from {Path(path).name}...")
-        text = ""
-        if file_type == "pdf":
-            text = self.extractor.from_pdf(path)
-        elif file_type == "image":
-            text = self.extractor.from_image(path)
+        text = self.extractor.from_pdf(path)
         
         try:
             if not text or text.startswith("No readable text") or len(text.strip()) < CONFIG.MIN_CHUNK_LENGTH:
@@ -491,12 +428,24 @@ class App:
             doc_name = Path(path).name
             self.chat_insert_system(f"File '{doc_name}' added to indexing queue...")
             self.indexer.enqueue(text, doc_name)
-            self.indexed_files.add(fid)
+            
+            self.indexed_docs[fid] = doc_name
+            # **MODIFIED**: Set the latest document name
+            self.latest_doc_name = doc_name
+            self.root.after(0, self.update_doc_filter_dropdown)
 
         except Exception as e:
             messagebox.showerror("Error", str(e))
         finally:
             self.set_busy(False)
+
+    def update_doc_filter_dropdown(self):
+        doc_names = sorted(list(self.indexed_docs.values()))
+        self.doc_filter_combo['values'] = ['All Documents'] + doc_names
+        
+        # **MODIFIED**: Automatically select the latest document in the dropdown
+        if self.latest_doc_name:
+            self.doc_filter_var.set(self.latest_doc_name)
 
     def on_send(self):
         if self.busy:
@@ -508,23 +457,30 @@ class App:
         self.chat_insert("YOU", query)
 
         self.set_busy(True, "Searching...")
+        
+        doc_filter = self.doc_filter_var.get()
+        if doc_filter == 'All Documents':
+            doc_filter = None
 
-        doc_filter = None
-        for fname in self.indexed_files:
-            if fname.lower() in query.lower():
-                doc_filter = fname
-                break
+        threading.Thread(target=self._query_worker, args=(query, doc_filter), daemon=True).start()
 
-        docs = self.vs.search(query, k=CONFIG.TOP_K, doc_filter=doc_filter)
-        history_context = self.memory.get_recent_history()
-        answer = self.qa.answer(docs, query, history_context)
+    def _query_worker(self, query: str, doc_filter: Optional[str]):
+        """Handles the search and generation in a separate thread."""
+        try:
+            docs = self.vs.search(query, k=CONFIG.TOP_K, doc_filter=doc_filter)
+            history_context = self.memory.get_recent_history()
+            answer = self.qa.answer(docs, query, history_context)
 
-        self.chat_insert("ASSISTANT", answer)
-        self.memory.add("USER", query)
-        self.memory.add("ASSISTANT", answer)
+            self.memory.add("USER", query)
+            self.memory.add("ASSISTANT", answer)
+            
+            self.root.after(0, self.chat_insert, "ASSISTANT", answer)
 
-        self.set_busy(False, "Ready")
-
+        except Exception as e:
+            logger.exception("Error during query worker execution.")
+            self.root.after(0, self.chat_insert_system, f"An error occurred: {e}")
+        finally:
+            self.root.after(0, self.set_busy, False, "Ready")
 
 
 # =============================================================================
